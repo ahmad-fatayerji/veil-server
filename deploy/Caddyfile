@@ -1,0 +1,9 @@
+{$SIGNAL_HOST} {
+    header {
+        Strict-Transport-Security "max-age=31536000"
+        Cache-Control "no-store"
+        X-Content-Type-Options "nosniff"
+    }
+    # No request logging: authentication headers and connection data are sensitive.
+    reverse_proxy signaling:8080
+}
