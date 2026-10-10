@@ -1,0 +1,8 @@
+/target/
+/.env
+/data/
+/secrets/
+*.pem
+*.key
+
+__pycache__/
