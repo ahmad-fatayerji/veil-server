@@ -38,9 +38,11 @@ docker compose exec signaling veil-server issue alice
 
 The last command prints Alice's host credential. Send it privately, never commit
 it or paste it into an issue. Alice enters `https://SIGNAL_HOST` and that credential
-in Veil, creates a session, then creates a separate invitation for each friend.
-The friend pastes the invitation and presses Join. Invitations expire in ten
-minutes and can be redeemed once. Use `docker compose exec signaling veil-server
+in Veil Settings. Create document works offline; Share uses the saved configuration
+and creates one reusable app link for friends. Friends need Veil installed and
+press Join after opening or pasting the link. Stop sharing or Reset link blocks
+new admission without disconnecting existing collaborators. Legacy ten-minute,
+single-use invitations remain supported. Use `docker compose exec signaling veil-server
 revoke alice` to revoke every credential issued under that name.
 
 Open/forward TCP 80 (certificate issuance), TCP/UDP 443 (signaling HTTPS), TCP/UDP
@@ -120,3 +122,8 @@ no private editor source belongs here. See [protocol.md](protocol.md) and
 [SECURITY.md](SECURITY.md). Local automation does not establish connectivity from
 unrelated Windows PCs. Test direct, TURN UDP, TURN TCP and optional TURN TLS on
 real networks before deploying to friends; universal connectivity is not promised.
+
+Reusable sharing requires the coordinated desktop update and this server revision.
+Old servers omit `groupSharing: 1`; the new desktop explains that an update is
+required instead of silently replacing group sharing with one-use invitations.
+Upgrade through your normal deployment process; source PRs do not deploy servers.
