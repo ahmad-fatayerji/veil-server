@@ -52,3 +52,58 @@ trust plaintext admitted metadata as document authentication.
 TURN uses coturn REST time-limited HMAC-SHA1 credentials, expiry 600 seconds.
 Issue only after direct failure. Refresh by authenticated replacement at 480 seconds
 for active selected relay paths. Never restart healthy unrelated host–guest links.
+
+
+## Reusable sharing extension (groupSharing=1)
+
+The v2 capabilities response advertises `groupSharing: 1`. Existing v2 invitations,
+WebSocket routing, relay grants and single-use semantics remain compatible.
+
+A host session ticket authorizes POST `/v3/sessions/:session/sharing` with
+`groupId` (32 lowercase hex) and `admissionHash` (SHA-256 of the hex admission
+credential). Registration atomically replaces the previous group capability.
+DELETE on the same endpoint disables new admission. Both leave all existing
+participant tickets and relay grants intact. Links have no independent expiry;
+they exist only in the host's in-memory session. Session teardown/restart ends them.
+
+POST `/v3/join` accepts sessionId, groupId, admission, inviteId (a fresh random
+32-hex link identifier), clientId (Yjs uint32), and guestPublic (base64 65-byte
+uncompressed P-256 ECDH public key). Only the current group capability admits.
+Each successful redemption gets its own random session ticket and immutable
+link/client/exchange-key binding. Duplicate link or client IDs are rejected.
+Guests cannot administer sharing, send on another participant's link, or obtain
+another participant's relay grant. Admission is rate limited without imposing
+an application-level participant count. The host receives `admitted` with
+inviteId, clientId, groupId and guestPublic; replayed socket-ready admissions
+retain that same binding.
+
+The app link is `veil://join/` followed by unpadded base64url UTF-8 JSON with
+version=4, server, sessionId, groupId, secret (32 random bytes as lowercase hex),
+hostClientId and hostPublic (base64 uncompressed P-256 ECDSA public key). The
+root secret and host private signing key are never sent to the server. Host
+private signing keys are generated per sharing capability and remain in memory.
+
+Group admission uses the existing invitationKeys HKDF with inviteId=groupId.
+For each admitted link, bootstrap keys use inviteId=that unique link ID and
+secret=the group's root. Bootstrap envelopes use v2 envelope encoding plus
+`bootstrap: true`; generation is zero. No SDP or private keys enter bootstrap.
+The host sends a signed canonical transcript in this exact property order:
+`{version:1,sessionId,groupId,inviteId,hostClientId,guestClientId,guestPublic,hostExchange}`.
+Signature is base64 ECDSA P-256/SHA-256 in WebCrypto's raw 64-byte encoding.
+The guest reconstructs its locally expected transcript and verifies against the
+hostPublic pinned in its invitation. Guests retry bootstrap by sending encrypted
+`{kind:"handshake",clientId}`. The host reuses the same transcript/exchange pair.
+
+Peers derive 256 ECDH bits, then HKDF-SHA-256 with salt=UTF-8 JSON transcript,
+info=UTF-8 JSON array `["veil.sharing.v1",groupRootSecret]`, producing a fresh
+32-byte per-link secret. Feed this into the existing invitationKeys derivation
+with the unique link ID to obtain independent host/guest AES-GCM keys. Final
+signaling uses the existing v2 authenticated envelope with bootstrap omitted;
+its cipher, nonce prefixes, sequence and replay counters are independent of
+bootstrap and every other guest. The final signaling and data-channel hello
+bind participant IDs and DTLS fingerprints as before. Knowing a shared invite
+cannot decrypt another established link or impersonate its pinned host.
+
+Revoking admission does not revoke previously admitted guests' editing access.
+Ending the host session disconnects them. Sharing remains a private capability:
+anyone given the link can edit. No permission roles or document storage are added.

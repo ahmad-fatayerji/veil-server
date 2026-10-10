@@ -109,6 +109,15 @@ struct Invite {
     expires: u64,
     client_id: Option<u32>,
     guest_ticket: Option<String>,
+    group: Option<GroupGuest>,
+}
+struct Sharing {
+    group_id: String,
+    admission_hash: String,
+}
+struct GroupGuest {
+    group_id: String,
+    guest_public: String,
 }
 struct Room {
     owner: String,
@@ -116,6 +125,7 @@ struct Room {
     host_client_id: u32,
     touched: u64,
     invites: HashMap<String, Invite>,
+    sharing: Option<Sharing>,
     sockets: HashMap<String, SocketSender>,
     paths: HashMap<String, String>,
 }
@@ -158,6 +168,7 @@ pub struct App {
     config: Config,
 }
 type Result<T> = std::result::Result<T, ApiError>;
+#[derive(Debug)]
 pub struct ApiError(StatusCode, &'static str);
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
@@ -273,6 +284,11 @@ pub fn router(app: App) -> Router {
         .route("/v2/sessions/{session}", delete(end))
         .route("/v2/sessions/{session}/invitations", post(invite))
         .route("/v2/join", post(join))
+        .route(
+            "/v3/sessions/{session}/sharing",
+            post(share).delete(stop_sharing),
+        )
+        .route("/v3/join", post(group_join))
         .route("/v2/relay", post(relay))
         .route("/v2/path", post(path_report))
         .route("/v2/leave", post(leave))
@@ -283,7 +299,7 @@ pub fn router(app: App) -> Router {
 }
 async fn capabilities(State(a): State<App>) -> Json<Value> {
     Json(
-        json!({"protocol":2,"stunUrls":a.config.stun_urls,"directTimeoutMs":6000,"relayTimeoutMs":20000}),
+        json!({"protocol":2,"groupSharing":1,"stunUrls":a.config.stun_urls,"directTimeoutMs":6000,"relayTimeoutMs":20000}),
     )
 }
 #[derive(Deserialize)]
@@ -309,6 +325,7 @@ async fn create(State(a): State<App>, h: HeaderMap, Json(b): Json<Create>) -> Re
             host_client_id: b.client_id,
             touched: now(),
             invites: HashMap::new(),
+            sharing: None,
             sockets: HashMap::new(),
             paths: HashMap::new(),
         },
@@ -362,6 +379,7 @@ async fn invite(
             expires: b.expires_at / 1000,
             client_id: None,
             guest_ticket: None,
+            group: None,
         },
     );
     r.touched = now();
@@ -403,6 +421,120 @@ async fn join(State(a): State<App>, Json(b): Json<Join>) -> Result<Json<Value>> 
         let _ =
             tx.try_send(json!({"kind":"admitted","inviteId":b.invite_id,"clientId":b.client_id}));
     }
+    Ok(Json(
+        json!({"ticket":ticket,"hostClientId":r.host_client_id,"stunUrls":a.config.stun_urls}),
+    ))
+}
+// The reusable capability is separate from each admitted participant. Revoking
+// it never removes participant tickets, relay grants, or healthy transports.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct Share {
+    group_id: String,
+    admission_hash: String,
+}
+async fn share(
+    State(a): State<App>,
+    Path(session): Path<String>,
+    h: HeaderMap,
+    Json(b): Json<Share>,
+) -> Result<Json<Value>> {
+    if !id(&b.group_id) || !secret(&b.admission_hash) {
+        return Err(bad());
+    }
+    let ticket = bearer(&h)?;
+    let mut d = a.data.lock().unwrap();
+    rate(&mut d, format!("sharing:{ticket}"), 60, 60)?;
+    let r = d.rooms.get_mut(&session).ok_or_else(denied)?;
+    if a.authorize(r, &ticket)?.is_some() {
+        return Err(denied());
+    }
+    r.sharing = Some(Sharing {
+        group_id: b.group_id,
+        admission_hash: b.admission_hash,
+    });
+    r.touched = now();
+    Ok(Json(json!({"ok":true})))
+}
+async fn stop_sharing(
+    State(a): State<App>,
+    Path(session): Path<String>,
+    h: HeaderMap,
+) -> Result<Json<Value>> {
+    let ticket = bearer(&h)?;
+    let mut d = a.data.lock().unwrap();
+    let r = d.rooms.get_mut(&session).ok_or_else(denied)?;
+    if a.authorize(r, &ticket)?.is_some() {
+        return Err(denied());
+    }
+    r.sharing = None;
+    r.touched = now();
+    Ok(Json(json!({"ok":true})))
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct GroupJoin {
+    session_id: String,
+    group_id: String,
+    admission: String,
+    invite_id: String,
+    client_id: u32,
+    guest_public: String,
+}
+fn public_key(s: &str) -> bool {
+    STANDARD
+        .decode(s)
+        .is_ok_and(|bytes| bytes.len() == 65 && bytes[0] == 4)
+}
+fn admitted(id: &str, client: u32, invite: &Invite) -> Value {
+    let mut event = json!({"kind":"admitted","inviteId":id,"clientId":client});
+    if let Some(group) = &invite.group {
+        event["groupId"] = json!(group.group_id);
+        event["guestPublic"] = json!(group.guest_public);
+    }
+    event
+}
+async fn group_join(State(a): State<App>, Json(b): Json<GroupJoin>) -> Result<Json<Value>> {
+    if !id(&b.session_id)
+        || !id(&b.group_id)
+        || !id(&b.invite_id)
+        || !secret(&b.admission)
+        || !public_key(&b.guest_public)
+    {
+        return Err(bad());
+    }
+    let mut d = a.data.lock().unwrap();
+    rate(&mut d, format!("group-join:{}", b.session_id), 120, 60)?;
+    let r = d.rooms.get_mut(&b.session_id).ok_or_else(denied)?;
+    if !a.owner_valid(&r.owner) {
+        return Err(denied());
+    }
+    let sharing = r.sharing.as_ref().ok_or_else(denied)?;
+    if sharing.group_id != b.group_id || sharing.admission_hash != hash(&b.admission) {
+        return Err(denied());
+    }
+    if b.client_id == r.host_client_id
+        || r.invites.contains_key(&b.invite_id)
+        || r.invites.values().any(|i| i.client_id == Some(b.client_id))
+    {
+        return Err(bad());
+    }
+    let ticket = random();
+    let invite = Invite {
+        admission_hash: String::new(),
+        expires: 0,
+        client_id: Some(b.client_id),
+        guest_ticket: Some(ticket.clone()),
+        group: Some(GroupGuest {
+            group_id: b.group_id,
+            guest_public: b.guest_public,
+        }),
+    };
+    if let Some(tx) = r.sockets.get(&r.host_ticket) {
+        let _ = tx.try_send(admitted(&b.invite_id, b.client_id, &invite));
+    }
+    r.invites.insert(b.invite_id, invite);
+    r.touched = now();
     Ok(Json(
         json!({"ticket":ticket,"hostClientId":r.host_client_id,"stunUrls":a.config.stun_urls}),
     ))
@@ -574,6 +706,8 @@ struct Envelope {
     sequence: u64,
     nonce: String,
     ciphertext: String,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    bootstrap: bool,
 }
 async fn socket_loop(a: App, session: String, ticket: String, ws: WebSocket) {
     let (tx, mut rx) = mpsc::channel(128);
@@ -599,7 +733,7 @@ async fn socket_loop(a: App, session: String, ticket: String, ws: WebSocket) {
         if guest.is_none() {
             for (id, i) in &r.invites {
                 if let Some(client) = i.client_id {
-                    let _ = tx.try_send(json!({"kind":"admitted","inviteId":id,"clientId":client}));
+                    let _ = tx.try_send(admitted(id, client, i));
                 }
             }
         }
@@ -613,7 +747,9 @@ async fn socket_loop(a: App, session: String, ticket: String, ws: WebSocket) {
                 if !matches!(tokio::time::timeout(std::time::Duration::from_secs(5),sink.send(Message::Text(msg.to_string().into()))).await, Ok(Ok(()))) {break;}
                 if terminal {break;}
             }
-            _=tick.tick()=> { if !matches!(tokio::time::timeout(std::time::Duration::from_secs(5),sink.send(Message::Ping(Vec::new().into()))).await, Ok(Ok(()))){break;} }
+            _=tick.tick()=> {
+                if let Some(r)=a.data.lock().unwrap().rooms.get_mut(&session) { r.touched=now(); }
+                if !matches!(tokio::time::timeout(std::time::Duration::from_secs(5),sink.send(Message::Ping(Vec::new().into()))).await, Ok(Ok(()))){break;} }
             msg=source.next()=> {
                 let Some(Ok(msg))=msg else{break};
                 let mut d=a.data.lock().unwrap();
@@ -754,6 +890,125 @@ mod tests {
                 .0,
             StatusCode::OK
         );
+    }
+    #[tokio::test]
+    async fn reusable_sharing_revokes_admission_not_participant_tickets() {
+        let (a, host) = app();
+        let (_, room) = request(&a, "/v2/sessions", &host, json!({"clientId":1})).await;
+        let s = room["sessionId"].as_str().unwrap();
+        let t = room["ticket"].as_str().unwrap();
+        let path = format!("/v3/sessions/{s}/sharing");
+        let group = "a".repeat(32);
+        let admission = random();
+        let mut key = vec![0; 65];
+        key[0] = 4;
+        let key = STANDARD.encode(key);
+        assert_eq!(
+            request(
+                &a,
+                &path,
+                &random(),
+                json!({"groupId":group,"admissionHash":hash(&admission)})
+            )
+            .await
+            .0,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            request(
+                &a,
+                &path,
+                t,
+                json!({"groupId":group,"admissionHash":hash(&admission)})
+            )
+            .await
+            .0,
+            StatusCode::OK
+        );
+        let body = |id: &str, client: u32| json!({"sessionId":s,"groupId":group,"admission":admission,"inviteId":id,"clientId":client,"guestPublic":key});
+        let first_id = "b".repeat(32);
+        let second_id = "c".repeat(32);
+        let (status, first) = request(&a, "/v3/join", "", body(&first_id, 2)).await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, second) = request(&a, "/v3/join", "", body(&second_id, 3)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_ne!(first["ticket"], second["ticket"]);
+        assert_eq!(
+            request(&a, "/v3/join", "", body(&first_id, 4)).await.0,
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            request(&a, "/v3/join", "", body(&"d".repeat(32), 2))
+                .await
+                .0,
+            StatusCode::BAD_REQUEST
+        );
+        let first_ticket = first["ticket"].as_str().unwrap();
+        assert_eq!(
+            request(
+                &a,
+                &path,
+                first_ticket,
+                json!({"groupId":"d".repeat(32),"admissionHash":hash(&admission)})
+            )
+            .await
+            .0,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            request(
+                &a,
+                "/v2/relay",
+                first_ticket,
+                json!({"sessionId":s,"inviteId":second_id})
+            )
+            .await
+            .0,
+            StatusCode::UNAUTHORIZED
+        );
+        // Atomic replacement prevents every new admission under the previous link.
+        assert_eq!(
+            request(
+                &a,
+                &path,
+                t,
+                json!({"groupId":"d".repeat(32),"admissionHash":hash(&random())})
+            )
+            .await
+            .0,
+            StatusCode::OK
+        );
+        assert_eq!(
+            request(&a, "/v3/join", "", body(&"e".repeat(32), 4))
+                .await
+                .0,
+            StatusCode::UNAUTHORIZED
+        );
+        let response = router(a.clone())
+            .oneshot(
+                Request::delete(&path)
+                    .header("authorization", format!("Bearer {t}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            request(&a, "/v3/join", "", body(&"f".repeat(32), 5))
+                .await
+                .0,
+            StatusCode::UNAUTHORIZED
+        );
+        let data = a.data.lock().unwrap();
+        let room = &data.rooms[s];
+        assert_eq!(a.authorize(room, first_ticket).unwrap(), Some(first_id));
+        assert_eq!(
+            a.authorize(room, second["ticket"].as_str().unwrap())
+                .unwrap(),
+            Some(second_id)
+        );
+        assert_eq!(data.issued, 0);
     }
     #[tokio::test]
     async fn opaque_socket_forwarding_rejects_role_substitution() {

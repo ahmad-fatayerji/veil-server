@@ -27,3 +27,11 @@ Coturn applies the IPv4 exclusions to mapped IPv4 addresses as well. Do not bloc
 the entire `::ffff:0:0/96` range: that also denies legitimate public IPv4 peers.
 Container CI checks public permissions succeed while private, loopback and
 link-local destinations are rejected, without sending traffic to those peers.
+
+Reusable sharing uses a revocable admission capability and a separate ticket for
+each guest. Clients pin the host signing public key from the app link and derive
+per-link encryption keys using authenticated ECDH. Shared invitation holders do
+not know other guests' established keys. Only the bootstrap contains public
+exchange keys; the server does not receive root secrets, private keys or document
+content. See protocol.md for transcript and domain separation details. Do not log
+invitation URLs. Reset/Stop sharing blocks new joins, not existing editing access.
