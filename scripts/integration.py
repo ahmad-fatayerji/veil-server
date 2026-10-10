@@ -72,10 +72,14 @@ with tempfile.TemporaryDirectory(prefix="veil-server-test-") as temporary:
         "listening-port=3479", "realm=veil-test", "use-auth-secret",
         "static-auth-secret=" + secret, "external-ip=127.0.0.1",
         "min-port=40000", "max-port=40040", "total-quota=32", "user-quota=4",
-        "allow-loopback-peers", "no-cli", "no-tls", "no-dtls", "relay-threads=1",
+        "cli=0", "no-tls", "relay-threads=1",
         "prometheus", "prometheus-address=0.0.0.0", "prometheus-port=9641",
         "log-file=stdout",
     ])
+    # Exercise the real destination policy, not only allocation authentication.
+    production = Path(__file__).resolve().parent.parent / "deploy" / "turnserver.conf"
+    config += "\n" + "\n".join(line for line in production.read_text().splitlines()
+                                if line.startswith("denied-peer-ip="))
     (folder / "turn.conf").write_text(config)
     suffix = secrets.token_hex(4)
     turn_name, signal_name = "veil-turn-" + suffix, "veil-signal-" + suffix
@@ -123,6 +127,14 @@ with tempfile.TemporaryDirectory(prefix="veil-server-test-") as temporary:
             key = hashlib.md5(relay["username"].encode() + b":" + realm + b":" + relay["credential"].encode()).digest()
             auth = attr(6, relay["username"].encode()) + attr(0x14, realm) + attr(0x15, nonce)
             assert stun(sock, 3, requested + auth, key)[0] == 0x103
+            for address, expected in [("8.8.8.8", 0x108), ("10.0.0.1", 0x118),
+                                      ("127.0.0.1", 0x118), ("169.254.1.1", 0x118)]:
+                peer = b"\0\x01" + struct.pack("!H", 49160 ^ (COOKIE >> 16)) + struct.pack(
+                    "!I", struct.unpack("!I", socket.inet_aton(address))[0] ^ COOKIE)
+                kind, fields = stun(sock, 8, attr(0x12, peer) + auth, key)
+                assert kind == expected, ("permission", address, hex(kind), hex(expected))
+                if expected == 0x118:
+                    assert fields[9][2:4] == b"\x04\x03", ("destination exclusion", address)
             metric_text = urllib.request.urlopen('http://127.0.0.1:19641/metrics', timeout=5).read().decode()
             assert sum(float(line.split()[-1]) for line in metric_text.splitlines() if line.startswith('turn_total_allocations{')) >= 1
             # Explicit allocation deletion, rather than assuming credential expiry cleans up.

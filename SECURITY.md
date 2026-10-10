@@ -20,4 +20,10 @@ abuse their permissions: deploy firewall egress restrictions as an additional la
 Keep coturn and base images patched and review resource ceilings periodically.
 
 Do not enable allow-loopback-peers or remove destination exclusions in production.
-The CI test profile permits loopback exclusively to exercise TURN on one machine.
+CI binds its listeners locally but retains production peer destination exclusions.
+Never add `denied-peer-ip=::`: coturn treats that unspecified address as a wildcard
+range and denies public peers too. Its default unspecified-peer guard remains on.
+Coturn applies the IPv4 exclusions to mapped IPv4 addresses as well. Do not block
+the entire `::ffff:0:0/96` range: that also denies legitimate public IPv4 peers.
+Container CI checks public permissions succeed while private, loopback and
+link-local destinations are rejected, without sending traffic to those peers.
