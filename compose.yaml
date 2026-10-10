@@ -1,0 +1,67 @@
+services:
+  signaling:
+    build: .
+    image: ghcr.io/ahmad-fatayerji/veil-server:latest
+    restart: unless-stopped
+    environment:
+      LISTEN: 0.0.0.0:8080
+      HOST_DB: /data/hosts.sqlite
+      TURN_SECRET_FILE: /run/secrets/turn_secret
+      METRICS_SECRET_FILE: /run/secrets/metrics_secret
+      STUN_URLS: stun:${TURN_HOST}:3478
+      TURN_URLS: turn:${TURN_HOST}:3478?transport=udp,turn:${TURN_HOST}:3478?transport=tcp
+      MAX_RELAY_GRANTS: ${MAX_RELAY_GRANTS:-8}
+    volumes:
+      - ./data:/data
+    secrets: [turn_secret, metrics_secret]
+    networks: [backend]
+    mem_limit: 128m
+    cpus: 0.5
+    security_opt: [no-new-privileges:true]
+    cap_drop: [ALL]
+    read_only: true
+    tmpfs: [/tmp]
+  caddy:
+    image: caddy:2.10.2-alpine
+    restart: unless-stopped
+    environment:
+      SIGNAL_HOST: ${SIGNAL_HOST}
+    ports: ["80:80", "443:443", "443:443/udp"]
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    networks: [backend]
+    mem_limit: 128m
+    cpus: 0.5
+  turn:
+    image: coturn/coturn:4.18.0-r0
+    restart: unless-stopped
+    network_mode: host
+    # Host networking is intentionally Linux-only. No TURN port is proxied by Caddy.
+    entrypoint: [/bin/sh, -ec]
+    command:
+      - |
+        umask 077
+        cp /etc/coturn/turnserver.conf /tmp/veil-turn.conf
+        printf '\nstatic-auth-secret=%s\n' "$$(cat /run/secrets/turn_secret)" >> /tmp/veil-turn.conf
+        exec turnserver -c /tmp/veil-turn.conf --realm="$${TURN_HOST}" --external-ip="$${TURN_PUBLIC_IP}"
+    environment:
+      TURN_HOST: ${TURN_HOST}
+      TURN_PUBLIC_IP: ${TURN_PUBLIC_IP}
+    volumes:
+      - ./deploy/turnserver.conf:/etc/coturn/turnserver.conf:ro
+    secrets: [turn_secret]
+    mem_limit: 256m
+    cpus: 1.0
+    security_opt: [no-new-privileges:true]
+secrets:
+  turn_secret:
+    file: ./secrets/turn-secret
+  metrics_secret:
+    file: ./secrets/metrics-secret
+networks:
+  backend:
+volumes:
+  caddy_data:
+  caddy_config:

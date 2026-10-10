@@ -1,0 +1,25 @@
+name: Publish server container
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+  packages: write
+jobs:
+  validate:
+    uses: ./.github/workflows/ci.yml
+    permissions:
+      contents: read
+  publish:
+    needs: validate
+    if: github.ref == 'refs/heads/develop' || github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - name: Build and publish exact validated source
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          printf '%s' "$GH_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          docker build -t ghcr.io/ahmad-fatayerji/veil-server:$GITHUB_SHA -t ghcr.io/ahmad-fatayerji/veil-server:latest .
+          docker push ghcr.io/ahmad-fatayerji/veil-server:$GITHUB_SHA
+          docker push ghcr.io/ahmad-fatayerji/veil-server:latest

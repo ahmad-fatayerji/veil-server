@@ -1,0 +1,9 @@
+services:
+  signaling:
+    environment:
+      TURN_URLS: turn:${TURN_HOST}:3478?transport=udp,turn:${TURN_HOST}:3478?transport=tcp,turns:${TURN_HOST}:5349?transport=tcp
+  turn:
+    volumes:
+      - ./deploy/turnserver.tls.conf:/etc/coturn/turnserver.conf:ro
+      - ./secrets/turn.crt:/run/tls/turn.crt:ro
+      - ./secrets/turn.key:/run/tls/turn.key:ro
