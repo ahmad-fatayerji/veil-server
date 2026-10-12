@@ -1,3 +1,4 @@
+mod compatibility;
 use axum::{
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
@@ -9,6 +10,7 @@ use axum::{
     Json, Router,
 };
 use base64::{engine::general_purpose::STANDARD, Engine};
+use compatibility::{check_client, check_pair, ClientCompatibility};
 use futures_util::{SinkExt, StreamExt};
 use hmac::{Hmac, Mac};
 use rusqlite::{params, Connection};
@@ -123,6 +125,7 @@ struct Room {
     owner: String,
     host_ticket: String,
     host_client_id: u32,
+    host_compatibility: Option<ClientCompatibility>,
     touched: u64,
     invites: HashMap<String, Invite>,
     sharing: Option<Sharing>,
@@ -289,6 +292,7 @@ pub fn router(app: App) -> Router {
             post(share).delete(stop_sharing),
         )
         .route("/v3/join", post(group_join))
+        .route("/v3/compatibility", post(preflight))
         .route("/v2/relay", post(relay))
         .route("/v2/path", post(path_report))
         .route("/v2/leave", post(leave))
@@ -299,16 +303,18 @@ pub fn router(app: App) -> Router {
 }
 async fn capabilities(State(a): State<App>) -> Json<Value> {
     Json(
-        json!({"protocol":2,"groupSharing":1,"stunUrls":a.config.stun_urls,"directTimeoutMs":6000,"relayTimeoutMs":20000}),
+        json!({"protocol":2,"groupSharing":1,"compatibility":1,"serverVersion":env!("CARGO_PKG_VERSION"),"serverProtocols":compatibility::SERVER_PROTOCOLS,"stunUrls":a.config.stun_urls,"directTimeoutMs":6000,"relayTimeoutMs":20000}),
     )
 }
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct Create {
     client_id: u32,
+    compatibility: Option<ClientCompatibility>,
 }
 async fn create(State(a): State<App>, h: HeaderMap, Json(b): Json<Create>) -> Result<Json<Value>> {
     let owner = a.host_owner(&h)?;
+    check_client(b.compatibility.as_ref())?;
     a.sweep();
     let mut d = a.data.lock().unwrap();
     rate(&mut d, format!("create:{owner}"), 10, 60)?;
@@ -323,6 +329,7 @@ async fn create(State(a): State<App>, h: HeaderMap, Json(b): Json<Create>) -> Re
             owner,
             host_ticket: ticket.clone(),
             host_client_id: b.client_id,
+            host_compatibility: b.compatibility,
             touched: now(),
             invites: HashMap::new(),
             sharing: None,
@@ -392,6 +399,7 @@ struct Join {
     invite_id: String,
     admission: String,
     client_id: u32,
+    compatibility: Option<ClientCompatibility>,
 }
 async fn join(State(a): State<App>, Json(b): Json<Join>) -> Result<Json<Value>> {
     if !id(&b.session_id) || !id(&b.invite_id) || !secret(&b.admission) {
@@ -407,6 +415,7 @@ async fn join(State(a): State<App>, Json(b): Json<Join>) -> Result<Json<Value>> 
     if i.expires <= now() || i.admission_hash != hash(&b.admission) || i.guest_ticket.is_some() {
         return Err(denied());
     }
+    check_pair(r.host_compatibility.as_ref(), b.compatibility.as_ref())?;
     if b.client_id == r.host_client_id
         || r.invites.values().any(|i| i.client_id == Some(b.client_id))
     {
@@ -422,7 +431,51 @@ async fn join(State(a): State<App>, Json(b): Json<Join>) -> Result<Json<Value>> 
             tx.try_send(json!({"kind":"admitted","inviteId":b.invite_id,"clientId":b.client_id}));
     }
     Ok(Json(
-        json!({"ticket":ticket,"hostClientId":r.host_client_id,"stunUrls":a.config.stun_urls}),
+        json!({"ticket":ticket,"hostClientId":r.host_client_id,"stunUrls":a.config.stun_urls,"hostCompatibility":r.host_compatibility}),
+    ))
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct Preflight {
+    session_id: String,
+    invite_id: Option<String>,
+    group_id: Option<String>,
+    admission: String,
+    compatibility: Option<ClientCompatibility>,
+}
+async fn preflight(State(a): State<App>, Json(b): Json<Preflight>) -> Result<Json<Value>> {
+    if !id(&b.session_id) || !secret(&b.admission) {
+        return Err(bad());
+    }
+    let mut d = a.data.lock().unwrap();
+    rate(&mut d, format!("compatibility:{}", b.session_id), 120, 60)?;
+    let r = d.rooms.get(&b.session_id).ok_or_else(denied)?;
+    if !a.owner_valid(&r.owner) {
+        return Err(denied());
+    }
+    match (&b.group_id, &b.invite_id) {
+        (Some(group), None) if id(group) => {
+            let sharing = r.sharing.as_ref().ok_or_else(denied)?;
+            if sharing.group_id != *group || sharing.admission_hash != hash(&b.admission) {
+                return Err(denied());
+            }
+        }
+        (None, Some(invite)) if id(invite) => {
+            let i = r.invites.get(invite).ok_or_else(denied)?;
+            if i.expires <= now()
+                || i.guest_ticket.is_some()
+                || i.admission_hash != hash(&b.admission)
+            {
+                return Err(denied());
+            }
+        }
+        _ => return Err(bad()),
+    }
+    let (server_protocol, peer_protocol) =
+        check_pair(r.host_compatibility.as_ref(), b.compatibility.as_ref())?;
+    Ok(Json(
+        json!({"hostClientId":r.host_client_id,"hostCompatibility":r.host_compatibility,
+        "serverVersion":env!("CARGO_PKG_VERSION"),"serverProtocol":server_protocol,"peerProtocol":peer_protocol}),
     ))
 }
 // The reusable capability is separate from each admitted participant. Revoking
@@ -480,6 +533,7 @@ struct GroupJoin {
     invite_id: String,
     client_id: u32,
     guest_public: String,
+    compatibility: Option<ClientCompatibility>,
 }
 fn public_key(s: &str) -> bool {
     STANDARD
@@ -513,6 +567,7 @@ async fn group_join(State(a): State<App>, Json(b): Json<GroupJoin>) -> Result<Js
     if sharing.group_id != b.group_id || sharing.admission_hash != hash(&b.admission) {
         return Err(denied());
     }
+    check_pair(r.host_compatibility.as_ref(), b.compatibility.as_ref())?;
     if b.client_id == r.host_client_id
         || r.invites.contains_key(&b.invite_id)
         || r.invites.values().any(|i| i.client_id == Some(b.client_id))
@@ -536,7 +591,7 @@ async fn group_join(State(a): State<App>, Json(b): Json<GroupJoin>) -> Result<Js
     r.invites.insert(b.invite_id, invite);
     r.touched = now();
     Ok(Json(
-        json!({"ticket":ticket,"hostClientId":r.host_client_id,"stunUrls":a.config.stun_urls}),
+        json!({"ticket":ticket,"hostClientId":r.host_client_id,"stunUrls":a.config.stun_urls,"hostCompatibility":r.host_compatibility}),
     ))
 }
 async fn end(
@@ -1107,5 +1162,109 @@ mod tests {
             .0,
             StatusCode::UNAUTHORIZED
         );
+    }
+    #[tokio::test]
+    async fn compatibility_preflight_and_atomic_admission() {
+        let (a, host) = app();
+        let metadata = json!({"appVersion":"0.5.0","serverProtocols":[2],"peerProtocols":[1]});
+        let (_, room) = request(
+            &a,
+            "/v2/sessions",
+            &host,
+            json!({"clientId":1,"compatibility":metadata}),
+        )
+        .await;
+        let s = room["sessionId"].as_str().unwrap();
+        let ticket = room["ticket"].as_str().unwrap();
+        let group = "a".repeat(32);
+        let admission = random();
+        let path = format!("/v3/sessions/{s}/sharing");
+        request(
+            &a,
+            &path,
+            ticket,
+            json!({"groupId":group,"admissionHash":hash(&admission)}),
+        )
+        .await;
+        let mut preview =
+            json!({"sessionId":s,"groupId":group,"admission":admission,"compatibility":metadata});
+        let (status, data) = request(&a, "/v3/compatibility", "", preview.clone()).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(data["hostCompatibility"], metadata);
+        assert_eq!(data["peerProtocol"], 1);
+        assert!(data.get("ticket").is_none());
+        assert!(a.data.lock().unwrap().rooms[s].invites.is_empty());
+        preview["admission"] = json!(random());
+        assert_eq!(
+            request(&a, "/v3/compatibility", "", preview.clone())
+                .await
+                .0,
+            StatusCode::UNAUTHORIZED
+        );
+        preview["admission"] = json!(admission);
+        preview["compatibility"]["peerProtocols"] = json!([2]);
+        assert_eq!(
+            request(&a, "/v3/compatibility", "", preview.clone())
+                .await
+                .1["error"],
+            "PEER_PROTOCOL_UNSUPPORTED"
+        );
+        let mut key = vec![0; 65];
+        key[0] = 4;
+        let mut join = json!({"sessionId":s,"groupId":group,"admission":admission,"inviteId":"b".repeat(32),"clientId":2,"guestPublic":STANDARD.encode(key),"compatibility":metadata});
+        join["compatibility"]["serverProtocols"] = json!([3]);
+        assert_eq!(
+            request(&a, "/v3/join", "", join.clone()).await.1["error"],
+            "CLIENT_PROTOCOL_UNSUPPORTED"
+        );
+        assert!(a.data.lock().unwrap().rooms[s].invites.is_empty());
+        join["compatibility"] = metadata.clone();
+        join["compatibility"]["appVersion"] = json!("0.4.0");
+        assert_eq!(
+            request(&a, "/v3/join", "", join.clone()).await.0,
+            StatusCode::OK
+        );
+        // Revoking after preflight must reject new admission, retaining admitted guests.
+        a.data.lock().unwrap().rooms.get_mut(s).unwrap().sharing = None;
+        join["inviteId"] = json!("c".repeat(32));
+        join["clientId"] = json!(3);
+        assert_eq!(
+            request(&a, "/v3/join", "", join).await.0,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(a.data.lock().unwrap().rooms[s].invites.len(), 1);
+        assert_eq!(
+            request(&a, "/v3/compatibility", "", preview).await.0,
+            StatusCode::UNAUTHORIZED
+        );
+    }
+    #[tokio::test]
+    async fn compatibility_legacy_invites_are_not_consumed_by_preview() {
+        let (a, host) = app();
+        let (_, room) = request(&a, "/v2/sessions", &host, json!({"clientId":1})).await;
+        let s = room["sessionId"].as_str().unwrap();
+        let ticket = room["ticket"].as_str().unwrap();
+        let invite = "a".repeat(32);
+        let admission = random();
+        request(&a, &format!("/v2/sessions/{s}/invitations"), ticket,
+            json!({"inviteId":invite,"admissionHash":hash(&admission),"expiresAt":(now()+600)*1000})).await;
+        let metadata = json!({"appVersion":"0.5.0","serverProtocols":[2],"peerProtocols":[1]});
+        let body =
+            json!({"sessionId":s,"inviteId":invite,"admission":admission,"compatibility":metadata});
+        let (status, preview) = request(&a, "/v3/compatibility", "", body.clone()).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(preview["hostCompatibility"].is_null());
+        let mut join = body;
+        join["clientId"] = json!(2);
+        join["compatibility"]["peerProtocols"] = json!([2]);
+        assert_eq!(
+            request(&a, "/v2/join", "", join.clone()).await.1["error"],
+            "PEER_PROTOCOL_UNSUPPORTED"
+        );
+        assert!(a.data.lock().unwrap().rooms[s].invites[&invite]
+            .guest_ticket
+            .is_none());
+        join["compatibility"] = metadata;
+        assert_eq!(request(&a, "/v2/join", "", join).await.0, StatusCode::OK);
     }
 }
