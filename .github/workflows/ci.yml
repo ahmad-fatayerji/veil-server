@@ -9,7 +9,9 @@ on:
 permissions:
   contents: read
 concurrency:
-  group: server-ci-${{ github.event.pull_request.number || github.ref }}
+  # Reusable CI inherits its caller's workflow name. Keep publication validation
+  # separate from branch CI so starting publication cannot cancel that CI run.
+  group: server-ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 jobs:
   rust:
