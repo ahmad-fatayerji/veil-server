@@ -127,3 +127,13 @@ Reusable sharing requires the coordinated desktop update and this server revisio
 Old servers omit `groupSharing: 1`; the new desktop explains that an update is
 required instead of silently replacing group sharing with one-use invitations.
 Upgrade through your normal deployment process; source PRs do not deploy servers.
+
+## Client compatibility
+
+Capabilities advertise the server software version and release-maintained API
+support. New clients can preview a session using its admission credential without
+consuming an invitation. Session creation/admission reject unsupported protocols;
+older clients retain API 2 / peer 1 support until it is explicitly retired.
+Different supported desktop versions may join after a feature-compatibility warning.
+See [protocol.md](protocol.md). Deploy coordinated server support before distributing
+the desktop feature; changing supported generations requires compatibility review.

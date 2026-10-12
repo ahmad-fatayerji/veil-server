@@ -53,7 +53,6 @@ TURN uses coturn REST time-limited HMAC-SHA1 credentials, expiry 600 seconds.
 Issue only after direct failure. Refresh by authenticated replacement at 480 seconds
 for active selected relay paths. Never restart healthy unrelated host–guest links.
 
-
 ## Reusable sharing extension (groupSharing=1)
 
 The v2 capabilities response advertises `groupSharing: 1`. Existing v2 invitations,
@@ -107,3 +106,44 @@ cannot decrypt another established link or impersonate its pinned host.
 Revoking admission does not revoke previously admitted guests' editing access.
 Ending the host session disconnects them. Sharing remains a private capability:
 anyone given the link can edit. No permission roles or document storage are added.
+
+## Compatibility before joining
+
+Release-maintained app metadata declares `appVersion`, `serverProtocols` and
+`peerProtocols`; current implementations support API generation 2 and peer
+generation 1. Server capabilities advertise `compatibility: 1`, `serverVersion`
+and `serverProtocols`. Package versions are descriptive; mutually implemented
+protocol generations determine whether admission is supported.
+
+After capability discovery, new clients send optional `compatibility` metadata
+on session creation and either join endpoint. Older servers receive the existing
+request shapes. An admission-credential-protected POST `/v3/compatibility` accepts
+`sessionId`, `admission`, `compatibility` and exactly one of `groupId`/`inviteId`.
+It previews `hostClientId`, nullable `hostCompatibility`, `serverVersion`,
+`serverProtocol` and `peerProtocol` without issuing a ticket or consuming an invite.
+Admission rechecks support and link validity under the same server lock.
+Unsupported client/server, host/server and peer combinations return HTTP 409 with
+`CLIENT_PROTOCOL_UNSUPPORTED`, `HOST_PROTOCOL_UNSUPPORTED` or
+`PEER_PROTOCOL_UNSUPPORTED`; these failures cannot be bypassed.
+
+Matching verified host/guest app versions proceed normally. Different supported
+versions require **Join anyway** or **Cancel**, warning that some features may not
+work properly. Missing server/host metadata requires confirmation that compatibility
+could not be verified. Compatibility warnings remain separate from connection
+notices. Cancelling before admission creates no ticket; cancelling after host
+authentication revokes the provisional guest admission before closing transports.
+
+Reusable-link bootstrap additionally carries `hostCompatibility` and
+`compatibilitySignature`. The signature is ECDSA P-256/SHA-256 over UTF-8 JSON
+`["veil.compatibility.v1", canonicalHandshake, canonicalHostCompatibility]`.
+The metadata property order is `appVersion`, `serverProtocols`, `peerProtocols`;
+array order is preserved. The original v1 handshake signature and ECDH transcript
+remain unchanged. Guests verify against the host identity pinned in the link before
+sending final signaling. Changed signed metadata requires renewed confirmation;
+invalid signatures or omitted previously advertised metadata stop admission.
+Legacy manual invitations retain their existing authentication limits and cannot
+provide a pinned host compatibility signature.
+
+Every networking change must assess server impact and update compatibility support,
+protocol documentation and coordinated app/server regression coverage as needed.
+Never declare unsupported generations or infer compatibility from equal versions.
