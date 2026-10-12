@@ -147,3 +147,72 @@ provide a pinned host compatibility signature.
 Every networking change must assess server impact and update compatibility support,
 protocol documentation and coordinated app/server regression coverage as needed.
 Never declare unsupported generations or infer compatibility from equal versions.
+
+## Short invitation extension (shortInvitations=1)
+
+This additive capability retains API generation 2 and peer generation 1. Existing
+sharing registrations without a shortInvitation record, legacy admission, and
+established signaling keep their prior behavior. Deploy this support before the
+coordinated desktop update. Software versions do not establish compatibility.
+
+New app links use `veil://join/<authority>/<code>`: HTTPS authority is a canonical
+host plus optional port, percent-encoded as one path segment. IPv6 brackets are
+encoded. The code is the canonical unpadded Base64url encoding of 16 random bytes
+(22 characters). Test-only HTTP loopback encodes the entire origin in that segment
+and is refused by production clients. Extra segments, query, fragment, user info,
+unsafe origins and noncanonical codes are rejected. Legacy long links still decode.
+
+HKDF-SHA-256 input is the decoded code; salt is UTF-8 canonical server origin.
+Info is `veil.short-invitation.v1:reference`, `:lookup`, or `:encryption`.
+Each output has 256 bits. Reference and lookup are lowercase hex; encryption is
+an AES-GCM-256 key. The code's entropy remains 128 bits. The code and encryption
+key never reach the server. Root invitation secrets remain unchanged.
+
+POST `/v3/sessions/:session/sharing` optionally adds `shortInvitation` containing
+reference, lookupHash (SHA-256 of the lookup credential's hex UTF-8), nonce
+(unpadded Base64url, 12 bytes), and ciphertext (unpadded Base64url, at most 8192
+characters and at least a 16-byte tag). The plaintext is the existing version-4
+long app link. AES-GCM uses a fresh nonce and a 128-bit tag; additional data is
+UTF-8 JSON array `["veil.short-invitation.v1",serverOrigin,reference]`.
+Registration is host-ticket-authenticated and atomically replaces admission and
+lookup state; invalid requests do not replace either. References must not collide
+with another live session. One encrypted record is retained per active sharing
+capability in memory, not in SQLite.
+
+POST `/v3/invitations/resolve` accepts reference and lookup. Verification returns
+only nonce and ciphertext. Missing, wrong and revoked credentials receive the
+same denial response. Resolution uses a shared 600-attempt/minute limiter rather
+than allocating limiter state for attacker-selected references. It does not
+refresh session lifetime or admit a guest. Stop, reset, expiry, host revocation,
+end and server restart invalidate lookup. Successful resolution is not admission.
+Clients decrypt locally and validate the embedded invitation and matching origin.
+
+For a short-record group, POST `/v3/join` requires `approvalProtocol: 1`. The guest
+gets a pending ticket with a 120-second deadline. Only generation-zero bootstrap
+envelopes are forwarded while pending; relay and established signaling are denied.
+There are at most 128 pending requests per session, not a connected-participant cap.
+POST `/v3/admission/decision` takes sessionId, inviteId and approve, authenticated
+by the host session ticket. Approval clears the deadline; rejection deletes the
+ticket/socket. Rejection may include a host-role generation-zero bootstrap envelope
+in `rejection`; the server queues it before the terminal `admission-ended` event
+and closes only that guest. Late host messages for removed admissions are ignored.
+Approval is idempotent for an existing admitted guest. Reset/Stop
+remove pending tickets but preserve approved tickets, transports and relay grants.
+Client Auto join sends approval after the guest's encrypted handshake request;
+Require approval waits for a local host decision. Server state alone never causes
+the client to sign a host handshake or start document transport.
+
+Guests send their requested name inside the encrypted bootstrap handshake request.
+Names are limited to 80 characters by clients and are not verified identities.
+The host snapshots its local join mode per admission. Changing mode retains the
+link and does not automatically approve existing waiting requests.
+
+A waiting/rejected bootstrap payload contains status and signature. Status is
+canonical JSON in this property order:
+`{version:1,sessionId,groupId,inviteId,hostClientId,guestClientId,guestPublic,state,deadline}`.
+State is waiting or rejected; deadline is Unix milliseconds. Signature is raw
+64-byte ECDSA P-256/SHA-256, standard Base64, over UTF-8 JSON array
+`["veil.admission-status.v1",status]`. Guests reconstruct expected identity and
+exchange fields locally and verify the signature against the invitation's pinned
+host key. Status does not release document access. Approval uses the existing
+signed handshake and per-link key derivation; no peer generation is removed.

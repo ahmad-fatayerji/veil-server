@@ -103,6 +103,29 @@ with tempfile.TemporaryDirectory(prefix="veil-server-test-") as temporary:
         host = docker("exec", signal_name, "veil-server", "issue", "test")
         http("/v2/sessions", "0" * 64, {"clientId": 1}, 401)
         room = http("/v2/sessions", host, {"clientId": 1})
+        assert http("/v2/capabilities")["shortInvitations"] == 1
+        reference, lookup = secrets.token_hex(32), secrets.token_hex(32)
+        group, root_admission = secrets.token_hex(16), secrets.token_hex(32)
+        record = {"reference": reference, "lookupHash": hashlib.sha256(lookup.encode()).hexdigest(),
+                  "nonce": "AAAAAAAAAAAAAAAA", "ciphertext": "AAAAAAAAAAAAAAAAAAAAAA"}
+        sharing = {"groupId": group, "admissionHash": hashlib.sha256(root_admission.encode()).hexdigest(),
+                   "shortInvitation": record}
+        sharing_path = "/v3/sessions/" + room["sessionId"] + "/sharing"
+        http(sharing_path, room["ticket"], sharing)
+        resolved = http("/v3/invitations/resolve", body={"reference": reference, "lookup": lookup})
+        assert resolved == {"nonce": record["nonce"], "ciphertext": record["ciphertext"]}
+        http("/v3/invitations/resolve", body={"reference": reference, "lookup": secrets.token_hex(32)}, expected=401)
+        pending_id = secrets.token_hex(16)
+        pending = http("/v3/join", body={"sessionId": room["sessionId"], "groupId": group,
+                       "admission": root_admission, "inviteId": pending_id, "clientId": 3,
+                       "guestPublic": base64.b64encode(bytes([4]) + bytes(64)).decode(), "approvalProtocol": 1})
+        pending_body = {"sessionId": room["sessionId"], "inviteId": pending_id}
+        http("/v2/relay", pending["ticket"], pending_body, 401)
+        http("/v3/admission/decision", pending["ticket"], dict(pending_body, approve=True), 401)
+        http("/v3/admission/decision", room["ticket"], dict(pending_body, approve=False))
+        sharing["shortInvitation"]["reference"] = secrets.token_hex(32)
+        http(sharing_path, room["ticket"], sharing)
+        http("/v3/invitations/resolve", body={"reference": reference, "lookup": lookup}, expected=401)
         invite_id, admission = secrets.token_hex(16), secrets.token_hex(32)
         http("/v2/sessions/" + room["sessionId"] + "/invitations", room["ticket"],
              {"inviteId": invite_id, "admissionHash": hashlib.sha256(admission.encode()).hexdigest(),
