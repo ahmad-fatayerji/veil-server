@@ -137,3 +137,13 @@ older clients retain API 2 / peer 1 support until it is explicitly retired.
 Different supported desktop versions may join after a feature-compatibility warning.
 See [protocol.md](protocol.md). Deploy coordinated server support before distributing
 the desktop feature; changing supported generations requires compatibility review.
+
+## Short links and optional approval
+
+Capabilities now advertise `shortInvitations: 1`. Updated hosts copy links with
+the server authority and a 22-character random code. Invitations are encrypted
+locally; the service never receives the code or invitation root secret. Hosts
+choose Auto join (default) or Require approval. Pending guests expire after two
+minutes and cannot obtain relay credentials. Existing long-link registrations
+remain supported. Upgrade the server before distributing the coordinated app;
+opening a source PR does not deploy or publish a container.

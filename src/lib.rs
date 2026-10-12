@@ -112,10 +112,58 @@ struct Invite {
     client_id: Option<u32>,
     guest_ticket: Option<String>,
     group: Option<GroupGuest>,
+    pending_until: Option<u64>,
 }
 struct Sharing {
     group_id: String,
     admission_hash: String,
+    short_invitation: Option<ShortInvitation>,
+}
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ShortInvitation {
+    reference: String,
+    lookup_hash: String,
+    nonce: String,
+    ciphertext: String,
+}
+fn url_bytes(value: &str) -> Option<Vec<u8>> {
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    let bytes = URL_SAFE_NO_PAD.decode(value).ok()?;
+    (URL_SAFE_NO_PAD.encode(&bytes) == value).then_some(bytes)
+}
+fn valid_short(record: &ShortInvitation) -> bool {
+    secret(&record.reference)
+        && secret(&record.lookup_hash)
+        && record.nonce.len() == 16
+        && url_bytes(&record.nonce).is_some_and(|b| b.len() == 12)
+        && record.ciphertext.len() <= 8192
+        && url_bytes(&record.ciphertext).is_some_and(|b| b.len() >= 16)
+}
+fn remove_guest(room: &mut Room, invite_id: &str) {
+    if let Some(invite) = room.invites.remove(invite_id) {
+        if let Some(ticket) = invite.guest_ticket {
+            if let Some(socket) = room.sockets.get(&ticket) {
+                // Keep the stop sender alive until the FIFO terminal event is delivered.
+                let _ = socket.try_send(json!({"kind":"admission-ended"}));
+            }
+        }
+    }
+    room.paths.remove(invite_id);
+    if let Some(host) = room.sockets.get(&room.host_ticket) {
+        let _ = host.try_send(json!({"kind":"left","inviteId":invite_id}));
+    }
+}
+fn cancel_pending(room: &mut Room) {
+    let pending: Vec<_> = room
+        .invites
+        .iter()
+        .filter(|(_, i)| i.pending_until.is_some())
+        .map(|(id, _)| id.clone())
+        .collect();
+    for id in pending {
+        remove_guest(room, &id);
+    }
 }
 struct GroupGuest {
     group_id: String,
@@ -253,7 +301,10 @@ impl App {
         }
         room.invites
             .iter()
-            .find(|(_, i)| i.guest_ticket.as_deref() == Some(ticket))
+            .find(|(_, i)| {
+                i.guest_ticket.as_deref() == Some(ticket)
+                    && i.pending_until.is_none_or(|until| until > now())
+            })
             .map(|(id, _)| Some(id.clone()))
             .ok_or_else(denied)
     }
@@ -266,6 +317,15 @@ impl App {
                 for tx in r.sockets.values() {
                     let _ = tx.try_send(json!({"kind":"ended"}));
                 }
+            }
+            let expired: Vec<_> = r
+                .invites
+                .iter()
+                .filter(|(_, i)| i.pending_until.is_some_and(|until| until <= t))
+                .map(|(id, _)| id.clone())
+                .collect();
+            for id in expired {
+                remove_guest(r, &id);
             }
             r.invites
                 .retain(|_, i| i.guest_ticket.is_some() || i.expires > t);
@@ -292,6 +352,8 @@ pub fn router(app: App) -> Router {
             post(share).delete(stop_sharing),
         )
         .route("/v3/join", post(group_join))
+        .route("/v3/invitations/resolve", post(resolve_invitation))
+        .route("/v3/admission/decision", post(admission_decision))
         .route("/v3/compatibility", post(preflight))
         .route("/v2/relay", post(relay))
         .route("/v2/path", post(path_report))
@@ -303,7 +365,7 @@ pub fn router(app: App) -> Router {
 }
 async fn capabilities(State(a): State<App>) -> Json<Value> {
     Json(
-        json!({"protocol":2,"groupSharing":1,"compatibility":1,"serverVersion":env!("CARGO_PKG_VERSION"),"serverProtocols":compatibility::SERVER_PROTOCOLS,"stunUrls":a.config.stun_urls,"directTimeoutMs":6000,"relayTimeoutMs":20000}),
+        json!({"protocol":2,"groupSharing":1,"shortInvitations":1,"compatibility":1,"serverVersion":env!("CARGO_PKG_VERSION"),"serverProtocols":compatibility::SERVER_PROTOCOLS,"stunUrls":a.config.stun_urls,"directTimeoutMs":6000,"relayTimeoutMs":20000}),
     )
 }
 #[derive(Deserialize)]
@@ -387,6 +449,7 @@ async fn invite(
             client_id: None,
             guest_ticket: None,
             group: None,
+            pending_until: None,
         },
     );
     r.touched = now();
@@ -485,6 +548,7 @@ async fn preflight(State(a): State<App>, Json(b): Json<Preflight>) -> Result<Jso
 struct Share {
     group_id: String,
     admission_hash: String,
+    short_invitation: Option<ShortInvitation>,
 }
 async fn share(
     State(a): State<App>,
@@ -492,19 +556,37 @@ async fn share(
     h: HeaderMap,
     Json(b): Json<Share>,
 ) -> Result<Json<Value>> {
-    if !id(&b.group_id) || !secret(&b.admission_hash) {
+    if !id(&b.group_id)
+        || !secret(&b.admission_hash)
+        || b.short_invitation
+            .as_ref()
+            .is_some_and(|record| !valid_short(record))
+    {
         return Err(bad());
     }
     let ticket = bearer(&h)?;
     let mut d = a.data.lock().unwrap();
     rate(&mut d, format!("sharing:{ticket}"), 60, 60)?;
+    if let Some(record) = &b.short_invitation {
+        if d.rooms.iter().any(|(id, r)| {
+            id != &session
+                && r.sharing
+                    .as_ref()
+                    .and_then(|s| s.short_invitation.as_ref())
+                    .is_some_and(|other| other.reference == record.reference)
+        }) {
+            return Err(bad());
+        }
+    }
     let r = d.rooms.get_mut(&session).ok_or_else(denied)?;
     if a.authorize(r, &ticket)?.is_some() {
         return Err(denied());
     }
+    cancel_pending(r);
     r.sharing = Some(Sharing {
         group_id: b.group_id,
         admission_hash: b.admission_hash,
+        short_invitation: b.short_invitation,
     });
     r.touched = now();
     Ok(Json(json!({"ok":true})))
@@ -520,8 +602,92 @@ async fn stop_sharing(
     if a.authorize(r, &ticket)?.is_some() {
         return Err(denied());
     }
+    cancel_pending(r);
     r.sharing = None;
     r.touched = now();
+    Ok(Json(json!({"ok":true})))
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ResolveInvitation {
+    reference: String,
+    lookup: String,
+}
+async fn resolve_invitation(
+    State(a): State<App>,
+    Json(b): Json<ResolveInvitation>,
+) -> Result<Json<Value>> {
+    if !secret(&b.reference) || !secret(&b.lookup) {
+        return Err(denied());
+    }
+    a.sweep();
+    let mut d = a.data.lock().unwrap();
+    rate(&mut d, "short-resolve".into(), 600, 60)?;
+    let record = d
+        .rooms
+        .values()
+        .filter_map(|r| r.sharing.as_ref())
+        .filter_map(|s| s.short_invitation.as_ref())
+        .find(|record| record.reference == b.reference && record.lookup_hash == hash(&b.lookup))
+        .ok_or_else(denied)?;
+    Ok(Json(
+        json!({"nonce":record.nonce,"ciphertext":record.ciphertext}),
+    ))
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct AdmissionDecision {
+    session_id: String,
+    invite_id: String,
+    approve: bool,
+    rejection: Option<Envelope>,
+}
+async fn admission_decision(
+    State(a): State<App>,
+    h: HeaderMap,
+    Json(b): Json<AdmissionDecision>,
+) -> Result<Json<Value>> {
+    if !id(&b.session_id) || !id(&b.invite_id) {
+        return Err(bad());
+    }
+    let ticket = bearer(&h)?;
+    let mut d = a.data.lock().unwrap();
+    let r = d.rooms.get_mut(&b.session_id).ok_or_else(denied)?;
+    if a.authorize(r, &ticket)?.is_some() {
+        return Err(denied());
+    }
+    let invite = r.invites.get_mut(&b.invite_id).ok_or_else(denied)?;
+    if b.approve {
+        if invite
+            .pending_until
+            .is_some_and(|deadline| deadline <= now())
+        {
+            remove_guest(r, &b.invite_id);
+            return Err(denied());
+        }
+        invite.pending_until = None;
+    } else {
+        if let Some(envelope) = b.rejection {
+            if envelope.invite_id != b.invite_id
+                || envelope.role != "host"
+                || !envelope.bootstrap
+                || envelope.generation != 0
+                || envelope.nonce.len() != 16
+                || envelope.ciphertext.len() > 96 * 1024
+                || envelope.sequence > 9007199254740991
+            {
+                return Err(bad());
+            }
+            if let Some(socket) = invite
+                .guest_ticket
+                .as_ref()
+                .and_then(|ticket| r.sockets.get(ticket))
+            {
+                let _ = socket.try_send(json!({"kind":"signal","envelope":envelope}));
+            }
+        }
+        remove_guest(r, &b.invite_id);
+    }
     Ok(Json(json!({"ok":true})))
 }
 #[derive(Deserialize)]
@@ -533,6 +699,7 @@ struct GroupJoin {
     invite_id: String,
     client_id: u32,
     guest_public: String,
+    approval_protocol: Option<u32>,
     compatibility: Option<ClientCompatibility>,
 }
 fn public_key(s: &str) -> bool {
@@ -549,6 +716,7 @@ fn admitted(id: &str, client: u32, invite: &Invite) -> Value {
     event
 }
 async fn group_join(State(a): State<App>, Json(b): Json<GroupJoin>) -> Result<Json<Value>> {
+    a.sweep();
     if !id(&b.session_id)
         || !id(&b.group_id)
         || !id(&b.invite_id)
@@ -564,7 +732,10 @@ async fn group_join(State(a): State<App>, Json(b): Json<GroupJoin>) -> Result<Js
         return Err(denied());
     }
     let sharing = r.sharing.as_ref().ok_or_else(denied)?;
-    if sharing.group_id != b.group_id || sharing.admission_hash != hash(&b.admission) {
+    if sharing.group_id != b.group_id
+        || sharing.admission_hash != hash(&b.admission)
+        || (sharing.short_invitation.is_some() && b.approval_protocol != Some(1))
+    {
         return Err(denied());
     }
     check_pair(r.host_compatibility.as_ref(), b.compatibility.as_ref())?;
@@ -574,8 +745,19 @@ async fn group_join(State(a): State<App>, Json(b): Json<GroupJoin>) -> Result<Js
     {
         return Err(bad());
     }
+    let pending = sharing.short_invitation.is_some();
+    if pending
+        && r.invites
+            .values()
+            .filter(|i| i.pending_until.is_some())
+            .count()
+            >= 128
+    {
+        return Err(full());
+    }
     let ticket = random();
     let invite = Invite {
+        pending_until: pending.then(|| now() + 120),
         admission_hash: String::new(),
         expires: 0,
         client_id: Some(b.client_id),
@@ -643,7 +825,7 @@ async fn relay(State(a): State<App>, h: HeaderMap, Json(b): Json<Relay>) -> Resu
         || !r
             .invites
             .get(&b.invite_id)
-            .is_some_and(|i| i.guest_ticket.is_some())
+            .is_some_and(|i| i.guest_ticket.is_some() && i.pending_until.is_none())
     {
         return Err(denied());
     }
@@ -712,7 +894,7 @@ async fn path_report(
         || !r
             .invites
             .get(&b.invite_id)
-            .is_some_and(|i| i.guest_ticket.is_some())
+            .is_some_and(|i| i.guest_ticket.is_some() && i.pending_until.is_none())
     {
         return Err(denied());
     }
@@ -798,7 +980,7 @@ async fn socket_loop(a: App, session: String, ticket: String, ws: WebSocket) {
     loop {
         tokio::select! {
             _=stopped.changed()=> {break;}
-            msg=rx.recv()=> { let Some(msg)=msg else{break}; let terminal=msg["kind"]=="ended" || msg["kind"]=="replaced";
+            msg=rx.recv()=> { let Some(msg)=msg else{break}; let terminal=msg["kind"]=="ended" || msg["kind"]=="replaced" || msg["kind"]=="admission-ended";
                 if !matches!(tokio::time::timeout(std::time::Duration::from_secs(5),sink.send(Message::Text(msg.to_string().into()))).await, Ok(Ok(()))) {break;}
                 if terminal {break;}
             }
@@ -809,13 +991,15 @@ async fn socket_loop(a: App, session: String, ticket: String, ws: WebSocket) {
                 let Some(Ok(msg))=msg else{break};
                 let mut d=a.data.lock().unwrap();
                 if rate(&mut d,format!("signal:{ticket}"),120,1).is_err(){break;}
-                let Some(r)=d.rooms.get_mut(&session) else{break}; let Ok(guest)=a.authorize(r,&ticket) else{break}; r.touched=now();
                 let Message::Text(text)=msg else { if matches!(msg,Message::Close(_)){break;} continue; };
+                let Some(r)=d.rooms.get_mut(&session) else{break}; let Ok(guest)=a.authorize(r,&ticket) else{break}; r.touched=now();
                 let Ok(e)=serde_json::from_str::<Envelope>(&text) else{break};
                 if !id(&e.invite_id) || e.nonce.len()!=16 || e.ciphertext.len()>96*1024 || e.sequence>9007199254740991 || e.generation>1_000_000 {break;}
+                if r.invites.get(&e.invite_id).is_some_and(|i| i.pending_until.is_some()) && (!e.bootstrap || e.generation != 0) {break;}
+                let is_host=guest.is_none();
                 let destination=if let Some(g)=guest { if g!=e.invite_id || e.role!="guest" {break;} Some(r.host_ticket.clone()) }
                     else { if e.role!="host" {break;} r.invites.get(&e.invite_id).and_then(|i|i.guest_ticket.clone()) };
-                let Some(dest)=destination else{break};
+                let Some(dest)=destination else{if is_host {continue;} break;};
                 // Offline receivers renegotiate when they reconnect; no unbounded mailbox.
                 if let Some(target)=r.sockets.get(&dest) { let _=target.try_send(json!({"kind":"signal","envelope":e})); }
                 d.forwarded+=1;
@@ -873,6 +1057,268 @@ mod tests {
             .await
             .unwrap();
         (status, serde_json::from_slice(&bytes).unwrap())
+    }
+    async fn delete_request(a: &App, path: &str, ticket: &str) -> StatusCode {
+        router(a.clone())
+            .oneshot(
+                Request::delete(path)
+                    .header("authorization", format!("Bearer {ticket}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .status()
+    }
+    #[tokio::test]
+    async fn short_lookup_is_authenticated_bounded_and_revocable() {
+        let (a, host) = app();
+        let (_, room) = request(&a, "/v2/sessions", &host, json!({"clientId":1})).await;
+        let session = room["sessionId"].as_str().unwrap();
+        let ticket = room["ticket"].as_str().unwrap();
+        let path = format!("/v3/sessions/{session}/sharing");
+        let lookup = random();
+        let reference = "a".repeat(64);
+        let record = json!({"reference":reference,"lookupHash":hash(&lookup),"nonce":"AAAAAAAAAAAAAAAA","ciphertext":"AAAAAAAAAAAAAAAAAAAAAA"});
+        let register = json!({"groupId":"b".repeat(32),"admissionHash":hash(&random()),"shortInvitation":record});
+        assert_eq!(
+            request(&a, &path, &random(), register.clone()).await.0,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            request(&a, &path, ticket, register.clone()).await.0,
+            StatusCode::OK
+        );
+        let resolve = json!({"reference":reference,"lookup":lookup});
+        let (status, value) = request(&a, "/v3/invitations/resolve", "", resolve.clone()).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            value,
+            json!({"nonce":record["nonce"],"ciphertext":record["ciphertext"]})
+        );
+        let wrong = request(
+            &a,
+            "/v3/invitations/resolve",
+            "",
+            json!({"reference":reference,"lookup":random()}),
+        )
+        .await;
+        let absent = request(
+            &a,
+            "/v3/invitations/resolve",
+            "",
+            json!({"reference":"f".repeat(64),"lookup":lookup}),
+        )
+        .await;
+        assert_eq!(wrong, absent);
+        assert_eq!(wrong.0, StatusCode::UNAUTHORIZED);
+        let mut invalid = register.clone();
+        invalid["shortInvitation"]["ciphertext"] = json!("A".repeat(8193));
+        assert_eq!(
+            request(&a, &path, ticket, invalid).await.0,
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            request(&a, "/v3/invitations/resolve", "", resolve.clone())
+                .await
+                .0,
+            StatusCode::OK
+        );
+        let mut replacement = register.clone();
+        replacement["shortInvitation"]["reference"] = json!("c".repeat(64));
+        assert_eq!(
+            request(&a, &path, ticket, replacement).await.0,
+            StatusCode::OK
+        );
+        assert_eq!(
+            request(&a, "/v3/invitations/resolve", "", resolve.clone())
+                .await
+                .0,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(delete_request(&a, &path, ticket).await, StatusCode::OK);
+        assert_eq!(
+            request(&a, "/v3/invitations/resolve", "", resolve.clone())
+                .await
+                .0,
+            StatusCode::UNAUTHORIZED
+        );
+        request(&a, &path, ticket, register.clone()).await;
+        a.data
+            .lock()
+            .unwrap()
+            .rooms
+            .get_mut(session)
+            .unwrap()
+            .touched = now() - 601;
+        assert_eq!(
+            request(&a, "/v3/invitations/resolve", "", resolve.clone())
+                .await
+                .0,
+            StatusCode::UNAUTHORIZED
+        );
+        let (_, room) = request(&a, "/v2/sessions", &host, json!({"clientId":1})).await;
+        request(
+            &a,
+            &format!(
+                "/v3/sessions/{}/sharing",
+                room["sessionId"].as_str().unwrap()
+            ),
+            room["ticket"].as_str().unwrap(),
+            register,
+        )
+        .await;
+        let (_, ended_room) = request(&a, "/v2/sessions", &host, json!({"clientId":7})).await;
+        let ended_session = ended_room["sessionId"].as_str().unwrap();
+        let ended_ticket = ended_room["ticket"].as_str().unwrap();
+        let ended_reference = "e".repeat(64);
+        request(&a, &format!("/v3/sessions/{ended_session}/sharing"), ended_ticket,
+            json!({"groupId":"d".repeat(32),"admissionHash":hash(&random()),"shortInvitation":{"reference":ended_reference,"lookupHash":hash(&lookup),"nonce":"AAAAAAAAAAAAAAAA","ciphertext":"AAAAAAAAAAAAAAAAAAAAAA"}})).await;
+        assert_eq!(
+            delete_request(&a, &format!("/v2/sessions/{ended_session}"), ended_ticket).await,
+            StatusCode::OK
+        );
+        assert_eq!(
+            request(
+                &a,
+                "/v3/invitations/resolve",
+                "",
+                json!({"reference":ended_reference,"lookup":lookup})
+            )
+            .await
+            .0,
+            StatusCode::UNAUTHORIZED
+        );
+        a.db.lock()
+            .unwrap()
+            .execute("DELETE FROM hosts WHERE name=?1", ["test"])
+            .unwrap();
+        assert_eq!(
+            request(&a, "/v3/invitations/resolve", "", resolve).await.0,
+            StatusCode::UNAUTHORIZED
+        );
+    }
+    #[tokio::test]
+    async fn short_resolution_rate_limit_does_not_allocate_per_guessed_reference() {
+        let (a, _) = app();
+        for _ in 0..600 {
+            assert_eq!(
+                request(
+                    &a,
+                    "/v3/invitations/resolve",
+                    "",
+                    json!({"reference":random(),"lookup":random()})
+                )
+                .await
+                .0,
+                StatusCode::UNAUTHORIZED
+            );
+        }
+        assert_eq!(
+            request(
+                &a,
+                "/v3/invitations/resolve",
+                "",
+                json!({"reference":random(),"lookup":random()})
+            )
+            .await
+            .0,
+            StatusCode::TOO_MANY_REQUESTS
+        );
+        assert_eq!(a.data.lock().unwrap().limits.len(), 1);
+    }
+    #[tokio::test]
+    async fn pending_guests_need_host_decision_and_expire_without_affecting_approved_guests() {
+        let (a, host) = app();
+        let (_, room) = request(&a, "/v2/sessions", &host, json!({"clientId":1})).await;
+        let session = room["sessionId"].as_str().unwrap();
+        let ticket = room["ticket"].as_str().unwrap();
+        let path = format!("/v3/sessions/{session}/sharing");
+        let admission = random();
+        let group = "a".repeat(32);
+        let register = json!({"groupId":group,"admissionHash":hash(&admission),"shortInvitation":{"reference":random(),"lookupHash":hash(&random()),"nonce":"AAAAAAAAAAAAAAAA","ciphertext":"AAAAAAAAAAAAAAAAAAAAAA"}});
+        assert_eq!(
+            request(&a, &path, ticket, register.clone()).await.0,
+            StatusCode::OK
+        );
+        let key = STANDARD.encode([vec![4], vec![0; 64]].concat());
+        let body = |id: &str, client: u32| json!({"sessionId":session,"groupId":group,"admission":admission,"inviteId":id,"clientId":client,"guestPublic":key,"approvalProtocol":1});
+        let first_id = "b".repeat(32);
+        let second_id = "c".repeat(32);
+        let mut unsupported = body(&first_id, 2);
+        unsupported
+            .as_object_mut()
+            .unwrap()
+            .remove("approvalProtocol");
+        assert_eq!(
+            request(&a, "/v3/join", "", unsupported).await.0,
+            StatusCode::UNAUTHORIZED
+        );
+        let (_, first) = request(&a, "/v3/join", "", body(&first_id, 2)).await;
+        let guest = first["ticket"].as_str().unwrap();
+        let relay_body = json!({"sessionId":session,"inviteId":first_id});
+        assert_eq!(
+            request(&a, "/v2/relay", guest, relay_body.clone()).await.0,
+            StatusCode::UNAUTHORIZED
+        );
+        let decision = json!({"sessionId":session,"inviteId":first_id,"approve":true});
+        assert_eq!(
+            request(&a, "/v3/admission/decision", guest, decision.clone())
+                .await
+                .0,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            request(&a, "/v3/admission/decision", ticket, decision)
+                .await
+                .0,
+            StatusCode::OK
+        );
+        assert_eq!(
+            request(&a, "/v2/relay", guest, relay_body).await.0,
+            StatusCode::OK
+        );
+        request(&a, "/v3/join", "", body(&second_id, 3)).await;
+        a.data
+            .lock()
+            .unwrap()
+            .rooms
+            .get_mut(session)
+            .unwrap()
+            .invites
+            .get_mut(&second_id)
+            .unwrap()
+            .pending_until = Some(now() - 1);
+        a.sweep();
+        assert!(!a.data.lock().unwrap().rooms[session]
+            .invites
+            .contains_key(&second_id));
+        assert!(a.data.lock().unwrap().rooms[session]
+            .invites
+            .contains_key(&first_id));
+        request(&a, "/v3/join", "", body(&second_id, 3)).await;
+        request(&a, &path, ticket, register).await;
+        assert!(!a.data.lock().unwrap().rooms[session]
+            .invites
+            .contains_key(&second_id));
+        assert!(a.data.lock().unwrap().rooms[session]
+            .invites
+            .contains_key(&first_id));
+        request(&a, "/v3/join", "", body(&second_id, 3)).await;
+        assert_eq!(
+            request(
+                &a,
+                "/v3/admission/decision",
+                ticket,
+                json!({"sessionId":session,"inviteId":second_id,"approve":false})
+            )
+            .await
+            .0,
+            StatusCode::OK
+        );
+        assert!(!a.data.lock().unwrap().rooms[session]
+            .invites
+            .contains_key(&second_id));
     }
     #[tokio::test]
     async fn authenticated_single_use_invites_and_lazy_bounded_relay() {
@@ -1142,6 +1588,124 @@ mod tests {
         .unwrap();
         // The healthy host socket remains registered after rejecting only the guest.
         assert!(a.data.lock().unwrap().rooms[s].sockets.contains_key(ticket));
+        service.abort();
+    }
+    #[tokio::test]
+    async fn pending_socket_allows_only_bootstrap_and_keeps_host_healthy() {
+        use tokio_tungstenite::tungstenite::{client::IntoClientRequest, Message as ClientMessage};
+        let (a, host) = app();
+        let (_, room) = request(&a, "/v2/sessions", &host, json!({"clientId":1})).await;
+        let session = room["sessionId"].as_str().unwrap();
+        let ticket = room["ticket"].as_str().unwrap();
+        let invite = "a".repeat(32);
+        let admission = random();
+        request(&a, &format!("/v3/sessions/{session}/sharing"), ticket,
+            json!({"groupId":"b".repeat(32),"admissionHash":hash(&admission),"shortInvitation":{"reference":random(),"lookupHash":hash(&random()),"nonce":"AAAAAAAAAAAAAAAA","ciphertext":"AAAAAAAAAAAAAAAAAAAAAA"}})).await;
+        let (_, guest) = request(&a, "/v3/join", "", json!({"sessionId":session,"groupId":"b".repeat(32),"admission":admission,"inviteId":invite,"clientId":2,"guestPublic":STANDARD.encode([vec![4],vec![0;64]].concat()),"approvalProtocol":1})).await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let service = tokio::spawn(axum::serve(listener, router(a.clone())).into_future());
+        let connection = |ticket: &str| {
+            let mut request = format!("ws://{address}/v2/socket/{session}")
+                .into_client_request()
+                .unwrap();
+            request
+                .headers_mut()
+                .insert("authorization", format!("Bearer {ticket}").parse().unwrap());
+            request
+        };
+        let (mut host_socket, _) = tokio_tungstenite::connect_async(connection(ticket))
+            .await
+            .unwrap();
+        let (mut guest_socket, _) =
+            tokio_tungstenite::connect_async(connection(guest["ticket"].as_str().unwrap()))
+                .await
+                .unwrap();
+        let signal = json!({"inviteId":invite,"role":"guest","generation":0,"sequence":0,"nonce":"AAAAAAAAAAAAAAAA","ciphertext":"opaque","bootstrap":true});
+        guest_socket
+            .send(ClientMessage::Text(signal.to_string().into()))
+            .await
+            .unwrap();
+        let forwarded = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if let Some(Ok(ClientMessage::Text(text))) = host_socket.next().await {
+                    let value: Value = serde_json::from_str(&text).unwrap();
+                    if value["kind"] == "signal" {
+                        break value;
+                    }
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(forwarded["envelope"], signal);
+        let mut established = signal;
+        established["bootstrap"] = json!(false);
+        established["sequence"] = json!(1);
+        guest_socket
+            .send(ClientMessage::Text(established.to_string().into()))
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while let Some(message) = guest_socket.next().await {
+                if message.is_err() || matches!(message, Ok(ClientMessage::Close(_))) {
+                    break;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        let (mut retry_socket, _) =
+            tokio_tungstenite::connect_async(connection(guest["ticket"].as_str().unwrap()))
+                .await
+                .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if let Some(Ok(ClientMessage::Text(text))) = retry_socket.next().await {
+                    let value: Value = serde_json::from_str(&text).unwrap();
+                    if value["kind"] == "ready" {
+                        break;
+                    }
+                }
+            }
+        })
+        .await
+        .unwrap();
+        let rejection = json!({"inviteId":invite,"role":"host","generation":0,"sequence":1,"nonce":"AAAAAAAAAAAAAAAA","ciphertext":"signed-rejection","bootstrap":true});
+        assert_eq!(
+            request(
+                &a,
+                "/v3/admission/decision",
+                ticket,
+                json!({"sessionId":session,"inviteId":invite,"approve":false,"rejection":rejection})
+            )
+            .await
+            .0,
+            StatusCode::OK
+        );
+        let delivered = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            let mut messages = Vec::new();
+            while let Some(Ok(message)) = retry_socket.next().await {
+                let ClientMessage::Text(text) = message else {
+                    continue;
+                };
+                let value: Value = serde_json::from_str(&text).unwrap();
+                if value["kind"] == "signal" {
+                    messages.push(value);
+                } else if value["kind"] == "admission-ended" {
+                    messages.push(value);
+                    break;
+                }
+            }
+            messages
+        })
+        .await
+        .unwrap();
+        assert_eq!(delivered[0]["envelope"], rejection);
+        assert_eq!(delivered[1]["kind"], "admission-ended");
+        assert!(a.data.lock().unwrap().rooms[session]
+            .sockets
+            .contains_key(ticket));
         service.abort();
     }
     #[tokio::test]

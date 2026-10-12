@@ -2,6 +2,7 @@
 use crate::{bad, ApiError, Result};
 use axum::http::StatusCode;
 use serde::{Deserialize, Serialize};
+// Short invitation/admission extensions are capability-gated; API 2 remains implemented.
 pub const SERVER_PROTOCOLS: &[u32] = &[2];
 const LEGACY_PEER_PROTOCOLS: &[u32] = &[1];
 #[derive(Clone, Debug, Deserialize, Serialize)]

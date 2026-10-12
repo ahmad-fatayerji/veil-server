@@ -35,3 +35,12 @@ not know other guests' established keys. Only the bootstrap contains public
 exchange keys; the server does not receive root secrets, private keys or document
 content. See protocol.md for transcript and domain separation details. Do not log
 invitation URLs. Reset/Stop sharing blocks new joins, not existing editing access.
+
+Short links carry a 128-bit code that never reaches the server. The service holds
+only domain-separated lookup credentials/hashes and the authenticated encrypted
+invitation record. Resolution is credential-authenticated, bounded and rate
+limited; it never refreshes a session lifetime. Pending short-link guest tickets
+expire after 120 seconds, cannot obtain TURN grants and can send only bootstrap
+signaling. Hosts gate signed key exchange and document transport locally. A
+server-side approval is not proof of the host's user decision. Names are unverified.
+Reset/Stop discard pending tickets and lookup state, preserving approved guests.
