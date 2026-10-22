@@ -85,8 +85,8 @@ When a limit is reached the desktop tells users and suggests self-hosting or
 another server. Public limits need the real client address: the bundled Caddy
 sets `X-Veil-Client-IP` and the server trusts it only from the private backend
 network (`CLIENT_IP_HEADER`). With another reverse proxy, overwrite that header
-with the validated client address; behind a CDN, resolve it from the CDN's
-trusted ranges first and restrict origin access to them. Each WebSocket holds a
+with the validated client address; behind a CDN, resolve it only from the CDN's
+trusted ranges, so clients that bypass the CDN keep their own address. Each WebSocket holds a
 proxy connection, so keep `MAX_SOCKETS` well below your proxy's worker limit if
 it serves other sites. Set `PUBLIC_HOSTING=off` and restart signaling to end all
 public sessions; credentialed hosts are unaffected.

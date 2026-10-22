@@ -60,4 +60,4 @@ reverse proxy must overwrite (not append to) that header with the address it
 validated, and the signaling listener must not be reachable from the internet
 directly. Behind a CDN, resolve the real client address only from the CDN's
 published ranges (for example Apache `mod_remoteip` with `RemoteIPTrustedProxy`),
-and restrict the origin to those ranges so the header cannot be bypassed.
+so clients that bypass the CDN are still limited by their own address.
