@@ -1,25 +1,48 @@
 name: Publish server container
 on:
+  push:
+    branches: [main]
   workflow_dispatch:
 permissions:
   contents: read
-  packages: write
+concurrency:
+  group: server-container-${{ github.ref }}
+  cancel-in-progress: false
 jobs:
   validate:
+    if: github.ref == 'refs/heads/main'
     uses: ./.github/workflows/ci.yml
     permissions:
       contents: read
   publish:
     needs: validate
-    if: github.ref == 'refs/heads/develop' || github.ref == 'refs/heads/main'
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
       - name: Build and publish exact validated source
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          set -euo pipefail
+          IMAGE="ghcr.io/${GITHUB_REPOSITORY,,}"
           printf '%s' "$GH_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
-          docker build -t ghcr.io/ahmad-fatayerji/veil-server:$GITHUB_SHA -t ghcr.io/ahmad-fatayerji/veil-server:latest .
-          docker push ghcr.io/ahmad-fatayerji/veil-server:$GITHUB_SHA
-          docker push ghcr.io/ahmad-fatayerji/veil-server:latest
+          trap 'docker logout ghcr.io' EXIT
+          docker build --pull \
+            --label "org.opencontainers.image.source=$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" \
+            --label "org.opencontainers.image.revision=$GITHUB_SHA" \
+            -t "$IMAGE:$GITHUB_SHA" .
+          docker push "$IMAGE:$GITHUB_SHA"
+          # A queued run or manual rerun of an old commit must not move latest back.
+          MAIN_SHA="$(git ls-remote origin refs/heads/main | cut -f1)"
+          if [ "$MAIN_SHA" = "$GITHUB_SHA" ]; then
+            docker tag "$IMAGE:$GITHUB_SHA" "$IMAGE:latest"
+            docker push "$IMAGE:latest"
+          else
+            echo 'main has advanced; published the commit tag without changing latest.'
+          fi
