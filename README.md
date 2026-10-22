@@ -140,6 +140,34 @@ content, decrypted signaling or invitation secrets are logged. Operators can
 observe addresses, timing, ciphertext sizes and relay traffic, or deny service;
 they cannot authenticate a substituted peer without the invitation secret.
 
+## Published server image
+
+`develop` is the integration branch; `main` is the production source branch.
+Promote changes with a PR from `develop` into `main`. Both branches require
+Server CI gate and resolved review conversations before merging, and reject force
+pushes and deletion. Merged feature branches are automatically deleted; `develop`
+and `main` remain protected.
+
+Every push to `main` runs Rust checks, protocol fixtures, Docker build and real
+STUN/TURN integration before publishing `ghcr.io/ahmad-fatayerji/veil-server`.
+Images have a full commit SHA tag and `latest`. Publication is serialized; rerunning
+an older commit publishes its SHA tag without moving `latest` backwards. Manual
+publication is available through **Publish server container** on `main` only.
+Publication never connects to or restarts an operator's server.
+
+Operators choose when to update. To use the published image with the bundled
+Compose configuration instead of building locally:
+
+```sh
+docker compose pull signaling
+docker compose up -d --no-build signaling
+```
+
+For a pinned release or rollback, override the signaling image with
+`ghcr.io/ahmad-fatayerji/veil-server:<full-commit-sha>` in a local Compose override.
+Keep the deployment configuration aligned with that source revision and preserve
+the data and secrets directories. Updating/restarting ends active registrations.
+
 ## Development and validation
 
 Upgrading an existing deployment keeps `data/hosts.sqlite` and every issued
