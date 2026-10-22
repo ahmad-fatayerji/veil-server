@@ -44,3 +44,20 @@ expire after 120 seconds, cannot obtain TURN grants and can send only bootstrap
 signaling. Hosts gate signed key exchange and document transport locally. A
 server-side approval is not proof of the host's user decision. Names are unverified.
 Reset/Stop discard pending tickets and lookup state, preserving approved guests.
+
+Public hosting (`PUBLIC_HOSTING=on`) lets anyone create sessions without a
+credential. It is off by default. Public sessions are bounded per client network
+(IPv4 address or IPv6 /64) and as a tier: sessions, guests per session, sockets
+and relay grants all have hard ceilings, and public relay grants are a subset of
+the global pool so credentialed hosts keep headroom. `MAX_SOCKETS` caps every
+live WebSocket so a busy server cannot exhaust reverse-proxy workers shared with
+other services. A client with many addresses can still consume the public tier;
+it cannot exceed the tier or affect credentialed capacity. Disable the tier and
+restart signaling to end all public sessions immediately.
+
+`CLIENT_IP_HEADER` is honoured only from loopback or private-network peers. Your
+reverse proxy must overwrite (not append to) that header with the address it
+validated, and the signaling listener must not be reachable from the internet
+directly. Behind a CDN, resolve the real client address only from the CDN's
+published ranges (for example Apache `mod_remoteip` with `RemoteIPTrustedProxy`),
+and restrict the origin to those ranges so the header cannot be bypassed.

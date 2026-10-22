@@ -10,13 +10,28 @@ services:
       METRICS_SECRET_FILE: /run/secrets/metrics_secret
       STUN_URLS: stun:${TURN_HOST}:3478
       TURN_URLS: turn:${TURN_HOST}:3478?transport=udp,turn:${TURN_HOST}:3478?transport=tcp
-      MAX_RELAY_GRANTS: ${MAX_RELAY_GRANTS:-8}
+      MAX_RELAY_GRANTS: ${MAX_RELAY_GRANTS:-16}
+      MAX_SOCKETS: ${MAX_SOCKETS:-60}
+      # Credential-less hosting stays off unless the operator opts in.
+      PUBLIC_HOSTING: ${PUBLIC_HOSTING:-off}
+      PUBLIC_MAX_SESSIONS: ${PUBLIC_MAX_SESSIONS:-12}
+      PUBLIC_SESSIONS_PER_IP: ${PUBLIC_SESSIONS_PER_IP:-3}
+      PUBLIC_MAX_GUESTS: ${PUBLIC_MAX_GUESTS:-5}
+      PUBLIC_MAX_SOCKETS: ${PUBLIC_MAX_SOCKETS:-40}
+      PUBLIC_RELAY_GRANTS: ${PUBLIC_RELAY_GRANTS:-8}
+      PUBLIC_RELAY_GRANTS_PER_IP: ${PUBLIC_RELAY_GRANTS_PER_IP:-2}
+      # Set by Caddy below; only honoured from the private backend network.
+      CLIENT_IP_HEADER: X-Veil-Client-IP
     volumes:
       - ./data:/data
     secrets: [turn_secret, metrics_secret]
     networks: [backend]
-    mem_limit: 128m
-    cpus: 0.5
+    # Low priority and hard ceilings keep a busy server from starving co-hosted services.
+    mem_limit: 96m
+    memswap_limit: 96m
+    cpus: 0.25
+    cpu_shares: 256
+    pids_limit: 128
     security_opt: [no-new-privileges:true]
     cap_drop: [ALL]
     read_only: true
@@ -52,8 +67,11 @@ services:
     volumes:
       - ./deploy/turnserver.conf:/etc/coturn/turnserver.conf:ro
     secrets: [turn_secret]
-    mem_limit: 256m
-    cpus: 1.0
+    mem_limit: 160m
+    memswap_limit: 160m
+    cpus: 0.5
+    cpu_shares: 256
+    pids_limit: 256
     security_opt: [no-new-privileges:true]
 secrets:
   turn_secret:

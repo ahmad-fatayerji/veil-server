@@ -19,8 +19,10 @@ def docker(*args):
     return subprocess.check_output(["docker", *args], stderr=subprocess.STDOUT).decode().strip()
 
 
-def http(path, credential=None, body=None, expected=200):
+def http(path, credential=None, body=None, expected=200, client_ip=None):
     headers = {"Content-Type": "application/json"}
+    if client_ip:
+        headers["X-Veil-Client-IP"] = client_ip
     if credential:
         headers["Authorization"] = "Bearer " + credential
     request = urllib.request.Request("http://127.0.0.1:18088" + path,
@@ -93,6 +95,8 @@ with tempfile.TemporaryDirectory(prefix="veil-server-test-") as temporary:
                "-e", "LISTEN=0.0.0.0:8080", "-e", "HOST_DB=/test/data/hosts.sqlite",
                "-e", "TURN_SECRET_FILE=/test/turn-secret", "-e", "METRICS_SECRET_FILE=/test/metrics-secret",
                "-e", "STUN_URLS=stun:127.0.0.1:3479", "-e", "TURN_URLS=turn:127.0.0.1:3479",
+               "-e", "PUBLIC_HOSTING=on", "-e", "PUBLIC_SESSIONS_PER_IP=1",
+               "-e", "CLIENT_IP_HEADER=X-Veil-Client-IP",
                os.environ.get("VEIL_SERVER_IMAGE", "veil-server:development"))
         for attempt in range(50):
             try:
@@ -103,7 +107,17 @@ with tempfile.TemporaryDirectory(prefix="veil-server-test-") as temporary:
         host = docker("exec", signal_name, "veil-server", "issue", "test")
         http("/v2/sessions", "0" * 64, {"clientId": 1}, 401)
         room = http("/v2/sessions", host, {"clientId": 1})
-        assert http("/v2/capabilities")["shortInvitations"] == 1
+        capabilities = http("/v2/capabilities")
+        assert capabilities["shortInvitations"] == 1 and capabilities["publicHosting"] == 1
+        # Docker's bridge gateway is a private peer, so the proxy header names the client.
+        public = http("/v2/sessions", body={"clientId": 1}, client_ip="198.51.100.1")
+        limited = http("/v2/sessions", body={"clientId": 1}, expected=429, client_ip="198.51.100.1")
+        assert limited["error"] == "PUBLIC_LIMIT_REACHED"
+        http("/v2/sessions", body={"clientId": 1}, client_ip="198.51.100.2")
+        assert http("/v2/metrics", metrics)["publicSessions"] == 2
+        request = urllib.request.Request("http://127.0.0.1:18088/v2/sessions/" + public["sessionId"],
+                                         method="DELETE", headers={"Authorization": "Bearer " + public["ticket"]})
+        assert urllib.request.urlopen(request, timeout=5).status == 200
         reference, lookup = secrets.token_hex(32), secrets.token_hex(32)
         group, root_admission = secrets.token_hex(16), secrets.token_hex(32)
         record = {"reference": reference, "lookupHash": hashlib.sha256(lookup.encode()).hexdigest(),
@@ -171,7 +185,7 @@ with tempfile.TemporaryDirectory(prefix="veil-server-test-") as temporary:
                 raise AssertionError('TURN allocation remained after explicit deletion')
         docker("exec", signal_name, "veil-server", "revoke", "test")
         http("/v2/relay", guest["ticket"], relay_body, 401)
-        print("PASS: container HTTP authentication, single use, lazy/cached TURN grants, actual STUN/allocate/delete and revocation")
+        print("PASS: container HTTP authentication, bounded public hosting, single use, lazy/cached TURN grants, actual STUN/allocate/delete and revocation")
     finally:
         for name in (signal_name, turn_name):
             subprocess.run(["docker", "rm", "-f", name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
