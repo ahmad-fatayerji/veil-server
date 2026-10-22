@@ -14,7 +14,9 @@ server source; desktop releases are coordinated separately in `ahmad-fatayerji/v
 Run cargo fmt --all -- --check, cargo clippy --all-targets --locked -- -D warnings,
 cargo test --locked, Compose configuration validation and relevant Docker integration
 tests. Wait for Server CI gate. Describe validation and internet/native acceptance
-limits in the PR. Container publication is explicit through Publish server container;
+limits in the PR. Publish server container automatically publishes validated main
+commits to GHCR; a PR into main authorizes package publication, not deployment.
+Manual publication is restricted to main. Never deploy a server from CI;
 never publish secrets or claim a local test proves universal internet connectivity.
 
 ## Coordinated compatibility maintenance
