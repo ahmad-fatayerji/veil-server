@@ -5,5 +5,8 @@
         X-Content-Type-Options "nosniff"
     }
     # No request logging: authentication headers and connection data are sensitive.
-    reverse_proxy signaling:8080
+    reverse_proxy signaling:8080 {
+        # Overwrites any client-sent value; the server uses it for public-tier limits.
+        header_up X-Veil-Client-IP {remote_host}
+    }
 }

@@ -16,7 +16,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         db.execute("DELETE FROM hosts WHERE name=?1", [name])?;
         return Ok(());
     }
-    let app = App::new(db, Config::from_env()?);
+    let config = Config::from_env()?;
+    if config.public.is_some() && config.client_ip_header.is_none() {
+        eprintln!("PUBLIC_HOSTING is on without CLIENT_IP_HEADER; behind a reverse proxy every public client shares one limit.");
+    }
+    let app = App::new(db, config);
     let sweep = app.clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
@@ -27,10 +31,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
     let address = std::env::var("LISTEN").unwrap_or("127.0.0.1:8080".into());
     let listener = tokio::net::TcpListener::bind(address).await?;
-    axum::serve(listener, router(app))
-        .with_graceful_shutdown(async {
-            let _ = tokio::signal::ctrl_c().await;
-        })
-        .await?;
+    axum::serve(
+        listener,
+        router(app).into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .with_graceful_shutdown(async {
+        let _ = tokio::signal::ctrl_c().await;
+    })
+    .await?;
     Ok(())
 }

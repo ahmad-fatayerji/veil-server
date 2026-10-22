@@ -2,9 +2,9 @@ mod compatibility;
 use axum::{
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
-        DefaultBodyLimit, Path, State,
+        ConnectInfo, DefaultBodyLimit, FromRequestParts, Path, State,
     },
-    http::{HeaderMap, StatusCode},
+    http::{request::Parts, HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::{delete, get, post},
     Json, Router,
@@ -19,6 +19,7 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::{
     collections::{HashMap, VecDeque},
+    net::{IpAddr, SocketAddr},
     sync::{Arc, Mutex},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -61,6 +62,41 @@ pub struct Config {
     pub metrics_secret: String,
     pub max_sessions: usize,
     pub max_relay_grants: usize,
+    /// Server-wide live WebSocket ceiling; protects the reverse proxy's workers.
+    pub max_sockets: usize,
+    /// Request header carrying the client IP; honoured only from loopback/private proxies.
+    pub client_ip_header: Option<String>,
+    /// Credential-less hosting tier. `None` keeps hosting operator-issued only.
+    pub public: Option<PublicLimits>,
+}
+#[derive(Clone)]
+pub struct PublicLimits {
+    pub max_sessions: usize,
+    pub sessions_per_ip: usize,
+    pub max_guests: usize,
+    pub max_sockets: usize,
+    pub relay_grants: usize,
+    pub relay_grants_per_ip: usize,
+}
+impl Default for PublicLimits {
+    fn default() -> Self {
+        Self {
+            max_sessions: 12,
+            sessions_per_ip: 3,
+            max_guests: 5,
+            max_sockets: 40,
+            relay_grants: 8,
+            relay_grants_per_ip: 2,
+        }
+    }
+}
+// Both tiers share coturn's total-quota; public grants are a bounded subset of it.
+const MAX_GRANTS: usize = 32;
+fn number(key: &str, default: usize) -> std::result::Result<usize, String> {
+    match std::env::var(key) {
+        Ok(value) => value.trim().parse().map_err(|_| format!("Invalid {key}")),
+        Err(_) => Ok(default),
+    }
 }
 impl Config {
     pub fn from_env() -> std::result::Result<Self, String> {
@@ -86,6 +122,48 @@ impl Config {
             }
             Ok(list)
         };
+        let public = match std::env::var("PUBLIC_HOSTING")
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "" | "off" | "false" | "0" => None,
+            "on" | "true" | "1" => {
+                let d = PublicLimits::default();
+                Some(PublicLimits {
+                    max_sessions: number("PUBLIC_MAX_SESSIONS", d.max_sessions)?,
+                    sessions_per_ip: number("PUBLIC_SESSIONS_PER_IP", d.sessions_per_ip)?,
+                    max_guests: number("PUBLIC_MAX_GUESTS", d.max_guests)?,
+                    max_sockets: number("PUBLIC_MAX_SOCKETS", d.max_sockets)?,
+                    relay_grants: number("PUBLIC_RELAY_GRANTS", d.relay_grants)?,
+                    relay_grants_per_ip: number(
+                        "PUBLIC_RELAY_GRANTS_PER_IP",
+                        d.relay_grants_per_ip,
+                    )?,
+                })
+            }
+            _ => return Err("PUBLIC_HOSTING must be on or off".into()),
+        };
+        let max_sockets = number("MAX_SOCKETS", 60)?;
+        if let Some(p) = &public {
+            if p.max_sockets > max_sockets || p.relay_grants > MAX_GRANTS {
+                return Err(
+                    "PUBLIC_MAX_SOCKETS and PUBLIC_RELAY_GRANTS must fit the server-wide caps"
+                        .into(),
+                );
+            }
+        }
+        let client_ip_header = std::env::var("CLIENT_IP_HEADER")
+            .ok()
+            .map(|h| h.trim().to_ascii_lowercase())
+            .filter(|h| !h.is_empty());
+        if client_ip_header
+            .as_deref()
+            .is_some_and(|h| axum::http::HeaderName::from_bytes(h.as_bytes()).is_err())
+        {
+            return Err("Invalid CLIENT_IP_HEADER".into());
+        }
         Ok(Self {
             stun_urls: urls("STUN_URLS")?,
             turn_urls: urls("TURN_URLS")?,
@@ -98,10 +176,10 @@ impl Config {
             .trim()
             .to_string(),
             max_sessions: 1024,
-            max_relay_grants: std::env::var("MAX_RELAY_GRANTS")
-                .unwrap_or("8".into())
-                .parse()
-                .map_err(|_| "Invalid MAX_RELAY_GRANTS")?,
+            max_relay_grants: number("MAX_RELAY_GRANTS", 16)?,
+            max_sockets,
+            client_ip_header,
+            public,
         })
     }
 }
@@ -171,6 +249,8 @@ struct GroupGuest {
 }
 struct Room {
     owner: String,
+    /// Client network key of a credential-less host; `None` for issued credentials.
+    public: Option<String>,
     host_ticket: String,
     host_client_id: u32,
     host_compatibility: Option<ClientCompatibility>,
@@ -235,6 +315,69 @@ fn denied() -> ApiError {
 fn full() -> ApiError {
     ApiError(StatusCode::TOO_MANY_REQUESTS, "CAPACITY_UNAVAILABLE")
 }
+// One public client used its own share; clients can retry later or self-host.
+fn public_limit() -> ApiError {
+    ApiError(StatusCode::TOO_MANY_REQUESTS, "PUBLIC_LIMIT_REACHED")
+}
+fn public_full() -> ApiError {
+    ApiError(StatusCode::SERVICE_UNAVAILABLE, "PUBLIC_CAPACITY_FULL")
+}
+fn sockets_full() -> ApiError {
+    ApiError(StatusCode::SERVICE_UNAVAILABLE, "CAPACITY_FULL")
+}
+fn guest_limit() -> ApiError {
+    ApiError(StatusCode::TOO_MANY_REQUESTS, "PUBLIC_GUEST_LIMIT")
+}
+/// TCP peer of the request, when the server runs with connect info.
+pub struct Peer(Option<SocketAddr>);
+impl<S: Send + Sync> FromRequestParts<S> for Peer {
+    type Rejection = std::convert::Infallible;
+    async fn from_request_parts(
+        parts: &mut Parts,
+        _: &S,
+    ) -> std::result::Result<Self, Self::Rejection> {
+        Ok(Peer(
+            parts
+                .extensions
+                .get::<ConnectInfo<SocketAddr>>()
+                .map(|info| info.0),
+        ))
+    }
+}
+// Only a same-host or private-network reverse proxy may name the client; internet
+// peers that reach the listener directly cannot choose their own limit key.
+fn proxy_peer(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => v4.is_loopback() || v4.is_private(),
+        IpAddr::V6(v6) => {
+            v6.is_loopback()
+                || (v6.segments()[0] & 0xfe00) == 0xfc00
+                || v6
+                    .to_ipv4_mapped()
+                    .is_some_and(|v4| v4.is_loopback() || v4.is_private())
+        }
+    }
+}
+// IPv6 clients usually control a whole /64, so it counts as one client.
+fn network_key(ip: IpAddr) -> String {
+    match ip {
+        IpAddr::V4(v4) => v4.to_string(),
+        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => v4.to_string(),
+            None => {
+                let s = v6.segments();
+                format!("{:x}:{:x}:{:x}:{:x}::/64", s[0], s[1], s[2], s[3])
+            }
+        },
+    }
+}
+fn room_sockets(d: &Data, public: bool) -> usize {
+    d.rooms
+        .values()
+        .filter(|r| !public || r.public.is_some())
+        .map(|r| r.sockets.len())
+        .sum()
+}
 fn id(s: &str) -> bool {
     s.len() == 32
         && s.bytes()
@@ -284,6 +427,25 @@ impl App {
             .query_row("SELECT 1 FROM hosts WHERE hash=?1", [owner], |_| Ok(()))
             .is_ok()
     }
+    // Public rooms have no credential to revoke; operators stop them by disabling the tier.
+    fn room_valid(&self, room: &Room) -> bool {
+        room.public.is_some() || self.owner_valid(&room.owner)
+    }
+    fn client_key(&self, h: &HeaderMap, peer: Option<SocketAddr>) -> String {
+        let peer = peer.map(|p| p.ip());
+        let forwarded = self
+            .config
+            .client_ip_header
+            .as_deref()
+            .filter(|_| peer.is_some_and(proxy_peer))
+            .and_then(|name| h.get(name))
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.trim().parse::<IpAddr>().ok());
+        forwarded
+            .or(peer)
+            .map(network_key)
+            .unwrap_or_else(|| "unknown".into())
+    }
     fn host_owner(&self, h: &HeaderMap) -> Result<String> {
         let owner = hash(&bearer(h)?);
         if self.owner_valid(&owner) {
@@ -293,7 +455,7 @@ impl App {
         }
     }
     fn authorize(&self, room: &Room, ticket: &str) -> Result<Option<String>> {
-        if !self.owner_valid(&room.owner) {
+        if !self.room_valid(room) {
             return Err(denied());
         }
         if room.host_ticket == ticket {
@@ -312,7 +474,7 @@ impl App {
         let mut d = self.data.lock().unwrap();
         let t = now();
         d.rooms.retain(|_, r| {
-            let keep = r.touched + 600 > t && self.owner_valid(&r.owner);
+            let keep = r.touched + 600 > t && self.room_valid(r);
             if !keep {
                 for tx in r.sockets.values() {
                     let _ = tx.try_send(json!({"kind":"ended"}));
@@ -364,9 +526,13 @@ pub fn router(app: App) -> Router {
         .with_state(app)
 }
 async fn capabilities(State(a): State<App>) -> Json<Value> {
-    Json(
-        json!({"protocol":2,"groupSharing":1,"shortInvitations":1,"compatibility":1,"serverVersion":env!("CARGO_PKG_VERSION"),"serverProtocols":compatibility::SERVER_PROTOCOLS,"stunUrls":a.config.stun_urls,"directTimeoutMs":6000,"relayTimeoutMs":20000}),
-    )
+    let mut value = json!({"protocol":2,"groupSharing":1,"shortInvitations":1,"compatibility":1,"serverVersion":env!("CARGO_PKG_VERSION"),"serverProtocols":compatibility::SERVER_PROTOCOLS,"stunUrls":a.config.stun_urls,"directTimeoutMs":6000,"relayTimeoutMs":20000});
+    if let Some(p) = &a.config.public {
+        value["publicHosting"] = json!(1);
+        value["publicLimits"] =
+            json!({"maxGuests":p.max_guests,"sessionsPerClient":p.sessions_per_ip});
+    }
+    Json(value)
 }
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -374,14 +540,49 @@ struct Create {
     client_id: u32,
     compatibility: Option<ClientCompatibility>,
 }
-async fn create(State(a): State<App>, h: HeaderMap, Json(b): Json<Create>) -> Result<Json<Value>> {
-    let owner = a.host_owner(&h)?;
+async fn create(
+    State(a): State<App>,
+    Peer(peer): Peer,
+    h: HeaderMap,
+    Json(b): Json<Create>,
+) -> Result<Json<Value>> {
+    // A present but wrong credential is rejected, never silently downgraded to public.
+    let public = match &a.config.public {
+        Some(p) if !h.contains_key("authorization") => Some((p, a.client_key(&h, peer))),
+        _ => None,
+    };
+    let owner = match &public {
+        Some((_, client)) => format!("public:{client}"),
+        None => a.host_owner(&h)?,
+    };
     check_client(b.compatibility.as_ref())?;
     a.sweep();
     let mut d = a.data.lock().unwrap();
-    rate(&mut d, format!("create:{owner}"), 10, 60)?;
     if d.rooms.len() >= a.config.max_sessions {
         return Err(full());
+    }
+    if let Some((p, client)) = &public {
+        rate(&mut d, format!("create:{owner}"), 6, 60).map_err(|_| public_limit())?;
+        let mine = d
+            .rooms
+            .values()
+            .filter(|r| r.public.as_ref() == Some(client))
+            .count();
+        if mine >= p.sessions_per_ip {
+            return Err(public_limit());
+        }
+        // Each host needs at least its own socket; refuse before the user shares.
+        if d.rooms.values().filter(|r| r.public.is_some()).count() >= p.max_sessions
+            || room_sockets(&d, true) >= p.max_sockets
+            || room_sockets(&d, false) >= a.config.max_sockets
+        {
+            return Err(public_full());
+        }
+    } else {
+        rate(&mut d, format!("create:{owner}"), 10, 60)?;
+        if room_sockets(&d, false) >= a.config.max_sockets {
+            return Err(sockets_full());
+        }
     }
     let session = Uuid::new_v4().simple().to_string();
     let ticket = random();
@@ -389,6 +590,7 @@ async fn create(State(a): State<App>, h: HeaderMap, Json(b): Json<Create>) -> Re
         session.clone(),
         Room {
             owner,
+            public: public.map(|(_, client)| client),
             host_ticket: ticket.clone(),
             host_client_id: b.client_id,
             host_compatibility: b.compatibility,
@@ -464,14 +666,38 @@ struct Join {
     client_id: u32,
     compatibility: Option<ClientCompatibility>,
 }
+// Every admitted guest opens a socket, so admission is refused once that socket cannot fit.
+fn guest_headroom(c: &Config, d: &Data, session: &str) -> Result<()> {
+    let Some(r) = d.rooms.get(session) else {
+        return Ok(());
+    };
+    if room_sockets(d, false) >= c.max_sockets {
+        return Err(sockets_full());
+    }
+    if let (Some(_), Some(p)) = (&r.public, &c.public) {
+        if room_sockets(d, true) >= p.max_sockets {
+            return Err(sockets_full());
+        }
+        if r.invites
+            .values()
+            .filter(|i| i.guest_ticket.is_some())
+            .count()
+            >= p.max_guests
+        {
+            return Err(guest_limit());
+        }
+    }
+    Ok(())
+}
 async fn join(State(a): State<App>, Json(b): Json<Join>) -> Result<Json<Value>> {
     if !id(&b.session_id) || !id(&b.invite_id) || !secret(&b.admission) {
         return Err(bad());
     }
     let mut d = a.data.lock().unwrap();
     rate(&mut d, format!("join:{}", b.session_id), 30, 60)?;
+    let headroom = guest_headroom(&a.config, &d, &b.session_id);
     let r = d.rooms.get_mut(&b.session_id).ok_or_else(denied)?;
-    if !a.owner_valid(&r.owner) {
+    if !a.room_valid(r) {
         return Err(denied());
     }
     let i = r.invites.get(&b.invite_id).ok_or_else(denied)?;
@@ -479,6 +705,7 @@ async fn join(State(a): State<App>, Json(b): Json<Join>) -> Result<Json<Value>> 
         return Err(denied());
     }
     check_pair(r.host_compatibility.as_ref(), b.compatibility.as_ref())?;
+    headroom?;
     if b.client_id == r.host_client_id
         || r.invites.values().any(|i| i.client_id == Some(b.client_id))
     {
@@ -513,7 +740,7 @@ async fn preflight(State(a): State<App>, Json(b): Json<Preflight>) -> Result<Jso
     let mut d = a.data.lock().unwrap();
     rate(&mut d, format!("compatibility:{}", b.session_id), 120, 60)?;
     let r = d.rooms.get(&b.session_id).ok_or_else(denied)?;
-    if !a.owner_valid(&r.owner) {
+    if !a.room_valid(r) {
         return Err(denied());
     }
     match (&b.group_id, &b.invite_id) {
@@ -727,8 +954,9 @@ async fn group_join(State(a): State<App>, Json(b): Json<GroupJoin>) -> Result<Js
     }
     let mut d = a.data.lock().unwrap();
     rate(&mut d, format!("group-join:{}", b.session_id), 120, 60)?;
+    let headroom = guest_headroom(&a.config, &d, &b.session_id);
     let r = d.rooms.get_mut(&b.session_id).ok_or_else(denied)?;
-    if !a.owner_valid(&r.owner) {
+    if !a.room_valid(r) {
         return Err(denied());
     }
     let sharing = r.sharing.as_ref().ok_or_else(denied)?;
@@ -739,6 +967,7 @@ async fn group_join(State(a): State<App>, Json(b): Json<GroupJoin>) -> Result<Js
         return Err(denied());
     }
     check_pair(r.host_compatibility.as_ref(), b.compatibility.as_ref())?;
+    headroom?;
     if b.client_id == r.host_client_id
         || r.invites.contains_key(&b.invite_id)
         || r.invites.values().any(|i| i.client_id == Some(b.client_id))
@@ -830,6 +1059,7 @@ async fn relay(State(a): State<App>, h: HeaderMap, Json(b): Json<Relay>) -> Resu
         return Err(denied());
     }
     let owner = r.owner.clone();
+    let public = r.public.is_some();
     let key = format!(
         "{}:{}:{}",
         b.session_id,
@@ -846,11 +1076,30 @@ async fn relay(State(a): State<App>, h: HeaderMap, Json(b): Json<Relay>) -> Resu
     rate(&mut d, format!("relay:{key}"), 1, 120)?;
     rate(&mut d, format!("relay-owner:{owner}"), 32, 600)?;
     d.grants.retain(|_, g| g.until > now());
-    if !d.grants.contains_key(&key)
-        && (d.grants.len() >= 32
-            || d.grants.values().filter(|g| g.owner == owner).count() >= a.config.max_relay_grants)
-    {
-        return Err(full());
+    if !d.grants.contains_key(&key) {
+        let owned = d.grants.values().filter(|g| g.owner == owner).count();
+        match (&a.config.public, public) {
+            (Some(p), true) => {
+                if owned >= p.relay_grants_per_ip {
+                    return Err(public_limit());
+                }
+                // The public pool is capped below MAX_GRANTS, so trusted hosts keep headroom.
+                let pooled = d
+                    .grants
+                    .values()
+                    .filter(|g| g.owner.starts_with("public:"))
+                    .count();
+                if pooled >= p.relay_grants || d.grants.len() >= MAX_GRANTS {
+                    return Err(public_full());
+                }
+            }
+            (None, true) => return Err(denied()),
+            (_, false) => {
+                if d.grants.len() >= MAX_GRANTS || owned >= a.config.max_relay_grants {
+                    return Err(full());
+                }
+            }
+        }
     }
     let expiry = now() + 600;
     let username = format!("{expiry}:{}", hash(&key));
@@ -912,8 +1161,14 @@ async fn metrics(State(a): State<App>, h: HeaderMap) -> Result<Json<Value>> {
             *paths.entry(path).or_default() += 1;
         }
     }
+    let public_sessions = d.rooms.values().filter(|r| r.public.is_some()).count();
+    let public_grants = d
+        .grants
+        .values()
+        .filter(|g| g.owner.starts_with("public:"))
+        .count();
     Ok(Json(
-        json!({"sessions":d.rooms.len(),"relayGrants":d.grants.len(),"relayCredentialsIssued":d.issued,"rateRejected":d.rejected,"signalingForwarded":d.forwarded,"reportedSelectedPaths":paths}),
+        json!({"sessions":d.rooms.len(),"publicSessions":public_sessions,"sockets":room_sockets(&d,false),"publicSockets":room_sockets(&d,true),"relayGrants":d.grants.len(),"publicRelayGrants":public_grants,"relayCredentialsIssued":d.issued,"rateRejected":d.rejected,"signalingForwarded":d.forwarded,"reportedSelectedPaths":paths}),
     ))
 }
 async fn socket(
@@ -928,6 +1183,9 @@ async fn socket(
         rate(&mut d, format!("socket:{ticket}"), 30, 60)?;
         let r = d.rooms.get(&session).ok_or_else(denied)?;
         a.authorize(r, &ticket)?;
+        if !socket_fits(&a.config, &d, &session, &ticket) {
+            return Err(sockets_full());
+        }
     }
     Ok(ws
         .max_message_size(128 * 1024)
@@ -946,11 +1204,29 @@ struct Envelope {
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     bootstrap: bool,
 }
+// A reconnect replaces its own socket, so it never needs extra headroom.
+fn socket_fits(c: &Config, d: &Data, session: &str, ticket: &str) -> bool {
+    let Some(r) = d.rooms.get(session) else {
+        return false;
+    };
+    if r.sockets.contains_key(ticket) {
+        return true;
+    }
+    room_sockets(d, false) < c.max_sockets
+        && (r.public.is_none()
+            || c.public
+                .as_ref()
+                .is_some_and(|p| room_sockets(d, true) < p.max_sockets))
+}
 async fn socket_loop(a: App, session: String, ticket: String, ws: WebSocket) {
     let (tx, mut rx) = mpsc::channel(128);
     let (stop, mut stopped) = watch::channel(false);
     {
         let mut d = a.data.lock().unwrap();
+        // Re-check under the lock: concurrent upgrades may have filled the cap meanwhile.
+        if !socket_fits(&a.config, &d, &session, &ticket) {
+            return;
+        }
         let Some(r) = d.rooms.get_mut(&session) else {
             return;
         };
@@ -1024,6 +1300,9 @@ mod tests {
     use std::future::IntoFuture;
     use tower::ServiceExt;
     fn app() -> (App, String) {
+        app_with(None, 60)
+    }
+    fn app_with(public: Option<PublicLimits>, max_sockets: usize) -> (App, String) {
         let db = credential_db(":memory:").unwrap();
         let token = issue(&db, "test").unwrap();
         (
@@ -1036,6 +1315,9 @@ mod tests {
                     metrics_secret: "d".repeat(64),
                     max_sessions: 10,
                     max_relay_grants: 1,
+                    max_sockets,
+                    client_ip_header: Some("x-veil-client-ip".into()),
+                    public,
                 },
             ),
             token,
@@ -1830,5 +2112,295 @@ mod tests {
             .is_none());
         join["compatibility"] = metadata;
         assert_eq!(request(&a, "/v2/join", "", join).await.0, StatusCode::OK);
+    }
+    async fn from_peer(
+        a: &App,
+        path: &str,
+        peer: &str,
+        client_ip: Option<&str>,
+        token: Option<&str>,
+        body: Value,
+    ) -> (StatusCode, Value) {
+        let mut builder = Request::post(path).header("content-type", "application/json");
+        if let Some(ip) = client_ip {
+            builder = builder.header("x-veil-client-ip", ip);
+        }
+        if let Some(token) = token {
+            builder = builder.header("authorization", format!("Bearer {token}"));
+        }
+        let mut req = builder.body(Body::from(body.to_string())).unwrap();
+        req.extensions_mut()
+            .insert(ConnectInfo(peer.parse::<SocketAddr>().unwrap()));
+        let response = router(a.clone()).oneshot(req).await.unwrap();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), 200000)
+            .await
+            .unwrap();
+        (status, serde_json::from_slice(&bytes).unwrap())
+    }
+    async fn get_json(a: &App, path: &str, token: Option<&str>) -> Value {
+        let mut builder = Request::get(path);
+        if let Some(token) = token {
+            builder = builder.header("authorization", format!("Bearer {token}"));
+        }
+        let response = router(a.clone())
+            .oneshot(builder.body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let bytes = axum::body::to_bytes(response.into_body(), 200000)
+            .await
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+    async fn relay_for(a: &App, s: &str, t: &str) -> (StatusCode, Value) {
+        request(
+            a,
+            "/v2/relay",
+            t,
+            json!({"sessionId":s,"inviteId":"b".repeat(32)}),
+        )
+        .await
+    }
+    fn limits() -> PublicLimits {
+        PublicLimits {
+            max_sessions: 3,
+            sessions_per_ip: 2,
+            max_guests: 1,
+            max_sockets: 40,
+            relay_grants: 1,
+            relay_grants_per_ip: 1,
+        }
+    }
+    const PROXY: &str = "127.0.0.1:40000";
+    #[tokio::test]
+    async fn public_hosting_is_off_by_default() {
+        let (a, _) = app();
+        let create = json!({"clientId":1});
+        let (status, _) = from_peer(
+            &a,
+            "/v2/sessions",
+            PROXY,
+            Some("198.51.100.1"),
+            None,
+            create,
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert!(get_json(&a, "/v2/capabilities", None)
+            .await
+            .get("publicHosting")
+            .is_none());
+    }
+    #[tokio::test]
+    async fn public_sessions_are_bounded_per_client_and_globally() {
+        let (a, host) = app_with(Some(limits()), 60);
+        let caps = get_json(&a, "/v2/capabilities", None).await;
+        assert_eq!(caps["publicHosting"], 1);
+        assert_eq!(caps["publicLimits"]["maxGuests"], 1);
+        let create = json!({"clientId":1});
+        let at =
+            |ip: &'static str| from_peer(&a, "/v2/sessions", PROXY, Some(ip), None, create.clone());
+        assert_eq!(at("198.51.100.1").await.0, StatusCode::OK);
+        assert_eq!(at("198.51.100.1").await.0, StatusCode::OK);
+        let (status, body) = at("198.51.100.1").await;
+        assert_eq!(
+            (status, body["error"].as_str()),
+            (StatusCode::TOO_MANY_REQUESTS, Some("PUBLIC_LIMIT_REACHED"))
+        );
+        assert_eq!(at("198.51.100.2").await.0, StatusCode::OK);
+        let (status, body) = at("198.51.100.3").await;
+        assert_eq!(
+            (status, body["error"].as_str()),
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Some("PUBLIC_CAPACITY_FULL")
+            )
+        );
+        // A full public tier leaves trusted hosts alone, and a wrong credential is never downgraded.
+        let trusted = from_peer(&a, "/v2/sessions", PROXY, None, Some(&host), create.clone()).await;
+        assert_eq!(trusted.0, StatusCode::OK);
+        let wrong = from_peer(
+            &a,
+            "/v2/sessions",
+            PROXY,
+            None,
+            Some(&random()),
+            create.clone(),
+        )
+        .await;
+        assert_eq!(wrong.0, StatusCode::UNAUTHORIZED);
+        let (session, ticket) = a
+            .data
+            .lock()
+            .unwrap()
+            .rooms
+            .iter()
+            .find(|(_, r)| r.public.is_some())
+            .map(|(s, r)| (s.clone(), r.host_ticket.clone()))
+            .unwrap();
+        assert_eq!(
+            delete_request(&a, &format!("/v2/sessions/{session}"), &ticket).await,
+            StatusCode::OK
+        );
+        assert_eq!(at("198.51.100.3").await.0, StatusCode::OK);
+    }
+    #[tokio::test]
+    async fn client_ip_header_is_trusted_only_from_proxies() {
+        let (a, _) = app_with(Some(limits()), 60);
+        let create = json!({"clientId":1});
+        let direct = "203.0.113.5:5000";
+        for (spoof, expected) in [
+            ("198.51.100.7", StatusCode::OK),
+            ("198.51.100.8", StatusCode::OK),
+            ("198.51.100.9", StatusCode::TOO_MANY_REQUESTS),
+        ] {
+            let (status, _) = from_peer(
+                &a,
+                "/v2/sessions",
+                direct,
+                Some(spoof),
+                None,
+                create.clone(),
+            )
+            .await;
+            assert_eq!(status, expected);
+        }
+        // One IPv6 /64 counts as one client.
+        let (a, _) = app_with(Some(limits()), 60);
+        for (ip, expected) in [
+            ("2001:db8::1", StatusCode::OK),
+            ("2001:db8::2", StatusCode::OK),
+            ("2001:db8::3", StatusCode::TOO_MANY_REQUESTS),
+        ] {
+            let (status, _) =
+                from_peer(&a, "/v2/sessions", PROXY, Some(ip), None, create.clone()).await;
+            assert_eq!(status, expected);
+        }
+    }
+    #[tokio::test]
+    async fn public_guest_cap_and_relay_pool_preserve_trusted_headroom() {
+        let (a, host) = app_with(Some(limits()), 60);
+        let mut rooms = Vec::new();
+        for (ip, token) in [
+            (Some("198.51.100.1"), None),
+            (Some("198.51.100.2"), None),
+            (None, Some(host.as_str())),
+        ] {
+            let (_, room) =
+                from_peer(&a, "/v2/sessions", PROXY, ip, token, json!({"clientId":1})).await;
+            let s = room["sessionId"].as_str().unwrap().to_string();
+            let t = room["ticket"].as_str().unwrap().to_string();
+            let mut joined = Vec::new();
+            for (n, client) in [("b", 2), ("c", 3)] {
+                let i = n.repeat(32);
+                let admission = random();
+                request(
+                    &a,
+                    &format!("/v2/sessions/{s}/invitations"),
+                    &t,
+                    json!({"inviteId":i,"admissionHash":hash(&admission),"expiresAt":(now()+600)*1000}),
+                )
+                .await;
+                joined.push(
+                    request(
+                        &a,
+                        "/v2/join",
+                        "",
+                        json!({"sessionId":s,"inviteId":i,"admission":admission,"clientId":client}),
+                    )
+                    .await,
+                );
+            }
+            rooms.push((s, t, joined));
+        }
+        for (_, _, joined) in &rooms[..2] {
+            assert_eq!(joined[0].0, StatusCode::OK);
+            assert_eq!(
+                (joined[1].0, joined[1].1["error"].as_str()),
+                (StatusCode::TOO_MANY_REQUESTS, Some("PUBLIC_GUEST_LIMIT"))
+            );
+        }
+        assert!(rooms[2]
+            .2
+            .iter()
+            .all(|(status, _)| *status == StatusCode::OK));
+        assert_eq!(
+            relay_for(&a, &rooms[0].0, &rooms[0].1).await.0,
+            StatusCode::OK
+        );
+        let (status, body) = relay_for(&a, &rooms[1].0, &rooms[1].1).await;
+        assert_eq!(
+            (status, body["error"].as_str()),
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Some("PUBLIC_CAPACITY_FULL")
+            )
+        );
+        assert_eq!(
+            relay_for(&a, &rooms[2].0, &rooms[2].1).await.0,
+            StatusCode::OK
+        );
+        let metrics = get_json(&a, "/v2/metrics", Some(&"d".repeat(64))).await;
+        assert_eq!(metrics["publicSessions"], 2);
+        assert_eq!(metrics["publicRelayGrants"], 1);
+        assert_eq!(metrics["relayGrants"], 2);
+    }
+    #[tokio::test]
+    async fn socket_cap_refuses_new_sockets_sessions_and_guests() {
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+        let (a, host) = app_with(None, 1);
+        let mut rooms = Vec::new();
+        for _ in 0..2 {
+            let (_, room) = request(&a, "/v2/sessions", &host, json!({"clientId":1})).await;
+            rooms.push((
+                room["sessionId"].as_str().unwrap().to_string(),
+                room["ticket"].as_str().unwrap().to_string(),
+            ));
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let service = tokio::spawn(axum::serve(listener, router(a.clone())).into_future());
+        let connect = |(s, t): &(String, String)| {
+            let mut req = format!("ws://{address}/v2/socket/{s}")
+                .into_client_request()
+                .unwrap();
+            req.headers_mut()
+                .insert("authorization", format!("Bearer {t}").parse().unwrap());
+            tokio_tungstenite::connect_async(req)
+        };
+        let _first = connect(&rooms[0]).await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while room_sockets(&a.data.lock().unwrap(), false) == 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(connect(&rooms[1]).await.is_err());
+        // Reconnecting an existing ticket replaces its own socket and needs no headroom.
+        assert!(connect(&rooms[0]).await.is_ok());
+        let (status, body) = request(&a, "/v2/sessions", &host, json!({"clientId":1})).await;
+        assert_eq!(
+            (status, body["error"].as_str()),
+            (StatusCode::SERVICE_UNAVAILABLE, Some("CAPACITY_FULL"))
+        );
+        let (s, t) = &rooms[0];
+        let admission = random();
+        request(
+            &a,
+            &format!("/v2/sessions/{s}/invitations"),
+            t,
+            json!({"inviteId":"b".repeat(32),"admissionHash":hash(&admission),"expiresAt":(now()+600)*1000}),
+        )
+        .await;
+        let (status, _) = request(
+            &a,
+            "/v2/join",
+            "",
+            json!({"sessionId":s,"inviteId":"b".repeat(32),"admission":admission,"clientId":2}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        service.abort();
     }
 }

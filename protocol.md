@@ -33,7 +33,7 @@ Yjs client ID; synchronize state vectors before closing a replacement's predeces
 | --------------------------------- | ---------------------------------------------------------------------------- |
 | GET /health                       | Public liveness/protocol version                                             |
 | GET /v2/capabilities              | Public STUN URLs and negotiation deadlines                                   |
-| POST /v2/sessions                 | Host Bearer credential; `{clientId}` → sessionId, ticket, stunUrls           |
+| POST /v2/sessions                 | Host Bearer credential (optional with publicHosting); `{clientId}` → sessionId, ticket, stunUrls |
 | POST /v2/sessions/:id/invitations | Host session ticket; inviteId, admissionHash, expiresAt                      |
 | POST /v2/join                     | sessionId, inviteId, admission, clientId → ticket, hostClientId, stunUrls    |
 | GET /v2/socket/:id                | Bearer session ticket; WSS opaque signaling                                  |
@@ -216,3 +216,35 @@ State is waiting or rejected; deadline is Unix milliseconds. Signature is raw
 exchange fields locally and verify the signature against the invitation's pinned
 host key. Status does not release document access. Approval uses the existing
 signed handshake and per-link key derivation; no peer generation is removed.
+
+## Public hosting extension (publicHosting=1)
+
+Operators may enable a credential-less hosting tier (`PUBLIC_HOSTING=on`). The
+capabilities response then also contains `publicHosting: 1` and
+`publicLimits: {maxGuests, sessionsPerClient}`. Without it, hosting requires an
+issued credential exactly as before.
+
+POST `/v2/sessions` without an `Authorization` header creates a public session.
+A present but invalid credential is still rejected with 401; it is never
+downgraded to the public tier. Public sessions otherwise use the same tickets,
+invitations, sharing, admission and socket protocol as credentialed sessions.
+
+Public limits are keyed by the client network: the IPv4 address or the IPv6 /64.
+Behind a reverse proxy the server reads the address from `CLIENT_IP_HEADER`, only
+when the TCP peer is loopback or a private address; otherwise it uses the peer.
+
+| Error (status)               | Meaning                                                              |
+| ---------------------------- | -------------------------------------------------------------------- |
+| `PUBLIC_LIMIT_REACHED` (429) | This client reached its public session, creation or relay allowance |
+| `PUBLIC_CAPACITY_FULL` (503) | The public tier has no free sessions, sockets or relay grants        |
+| `PUBLIC_GUEST_LIMIT` (429)   | The public session already has `maxGuests` admitted/pending guests   |
+| `CAPACITY_FULL` (503)        | The server-wide socket ceiling (`MAX_SOCKETS`) is reached            |
+
+Session creation reports `PUBLIC_CAPACITY_FULL` or `CAPACITY_FULL` before a
+session is shared, so clients can suggest another server. WebSocket upgrades past
+the ceiling receive 503 `CAPACITY_FULL`; reconnecting an already connected ticket
+replaces its socket and never needs headroom. Joins are refused once the guest's
+socket cannot fit. Public relay grants come from a separate pool inside the
+32-grant total, so credentialed hosts always keep relay headroom.
+
+Metrics add `publicSessions`, `sockets`, `publicSockets` and `publicRelayGrants`.

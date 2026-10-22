@@ -2,8 +2,9 @@
 
 MIT-licensed, self-hosted signaling and selective WebRTC relay for Veil desktop.
 Friends install only Veil. Operators maintain this Linux stack; hosts save their
-operator-issued credential once. There is no public registration, default cloud
-provider, document storage or host migration.
+operator-issued credential once, or host without one when the operator enables
+the bounded public tier. There is no account registration, document storage or
+host migration.
 
 The desktop forms a star: five host–guest connections in a six-person session.
 Each connection tries STUN/direct ICE for six seconds without TURN credentials.
@@ -52,11 +53,43 @@ for a host behind NAT use coturn's `PUBLIC_IP/PRIVATE_IP` mapping. Host networki
 for coturn intentionally requires Linux. Caddy terminates signaling HTTPS;
 TURN is not HTTP and does not pass through Caddy.
 
+The bundled containers run at low CPU priority with hard memory, CPU and process
+ceilings (signaling 96 MiB/0.25 CPU, TURN 160 MiB/0.5 CPU), so a busy Veil server
+slows down instead of starving other services on the same machine. Lower coturn's
+`bps-capacity` if relay bandwidth must stay below the default 8 MiB/s.
+
 Restrict access to the Docker socket and secret files. Back up `data/hosts.sqlite`
 and configuration securely; there are no document snapshots to back up. Restarting
 signaling terminates registrations. Healthy existing peer transports may continue
 until clients learn their registration is gone; local content stays visible for
 copying. New joins/recovery require a new host session.
+
+## Optional public hosting
+
+Set `PUBLIC_HOSTING=on` in `.env` to let anyone host without a credential. Issued
+credentials keep working as a trusted tier whose capacity public load cannot use.
+Each limit is an environment variable:
+
+| Variable                     | Default | Meaning                                              |
+| ---------------------------- | ------: | ---------------------------------------------------- |
+| `MAX_SOCKETS`                |      60 | Live WebSockets server-wide, both tiers              |
+| `PUBLIC_MAX_SESSIONS`        |      12 | Concurrent public sessions                           |
+| `PUBLIC_SESSIONS_PER_IP`     |       3 | Concurrent public sessions per IPv4 address/IPv6 /64 |
+| `PUBLIC_MAX_GUESTS`          |       5 | Guests per public session                            |
+| `PUBLIC_MAX_SOCKETS`         |      40 | Live WebSockets used by public sessions              |
+| `PUBLIC_RELAY_GRANTS`        |       8 | Public relay grants (of the 32 total)                |
+| `PUBLIC_RELAY_GRANTS_PER_IP` |       2 | Public relay grants per client network               |
+| `MAX_RELAY_GRANTS`           |      16 | Relay grants per issued credential                   |
+
+When a limit is reached the desktop tells users and suggests self-hosting or
+another server. Public limits need the real client address: the bundled Caddy
+sets `X-Veil-Client-IP` and the server trusts it only from the private backend
+network (`CLIENT_IP_HEADER`). With another reverse proxy, overwrite that header
+with the validated client address; behind a CDN, resolve it only from the CDN's
+trusted ranges, so clients that bypass the CDN keep their own address. Each WebSocket holds a
+proxy connection, so keep `MAX_SOCKETS` well below your proxy's worker limit if
+it serves other sites. Set `PUBLIC_HOSTING=off` and restart signaling to end all
+public sessions; credentialed hosts are unaffected.
 
 ## Optional TURN TLS
 
@@ -73,7 +106,8 @@ docker compose -f compose.yaml -f compose.tls.yaml up -d --build
 The initial profile permits 32 allocations total, four per credential,
 256 KiB/s per allocation per direction and an 8 MiB/s aggregate bandwidth budget.
 These are coturn resource ceilings, not a participant cap. The signaling service
-allows eight active endpoint grants per host by default, with cached identities,
+allows sixteen active endpoint grants per host credential by default (shared by
+all documents that host has open), with cached identities,
 bounded renewal and issuance. Increase MAX_RELAY_GRANTS and coturn quotas only
 after measuring the server and reviewing its budget. One connection can allocate
 more than one TURN socket during ICE; credentials do not imply a selected relay.
@@ -107,6 +141,15 @@ observe addresses, timing, ciphertext sizes and relay traffic, or deny service;
 they cannot authenticate a substituted peer without the invitation secret.
 
 ## Development and validation
+
+Upgrading an existing deployment keeps `data/hosts.sqlite` and every issued
+credential; current sessions end and hosts share again:
+
+```sh
+git pull
+docker compose up -d --build
+curl -s https://YOUR_SIGNAL_HOST/v2/capabilities
+```
 
 ```sh
 cargo fmt --all -- --check
