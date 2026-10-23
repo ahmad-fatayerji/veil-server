@@ -1,87 +1,84 @@
-# Configuration
+# Environment variables
 
-For the standard Docker setup, edit `.env`. Apply changes with
-`docker compose up -d --no-build`; restarting signaling ends active registrations.
+Edit `.env` for the bundled Compose deployment. Changes take effect when the
+containers are recreated. A signaling restart loses active session registrations.
+The example addresses are placeholders; replace them with your own.
 
 ## Server addresses
 
-| Variable | Value | Meaning |
+| Variable | How it works |
+| --- | --- |
+| `SIGNAL_HOST` | Public hostname for the sharing API, such as `signal.example.com`. Caddy uses it to obtain an HTTPS certificate and route requests to signaling. Users enter `https://signal.example.com` in Veil. |
+| `TURN_HOST` | Public hostname for connection discovery and relay, such as `turn.example.com`. Signaling advertises this address to apps, and coturn uses it as its authentication realm. It can be the same hostname as `SIGNAL_HOST`. |
+| `TURN_PUBLIC_IP` | Public IPv4 address coturn advertises for relay traffic. This must be reachable by the apps. Behind NAT, use `PUBLIC_IP/PRIVATE_IP`, for example `203.0.113.10/192.168.1.10`, so coturn maps its local address to the public one. |
+
+Both hostnames need DNS records pointing to the server. Enter hostnames without
+`https://`, paths, or port numbers. Only publish IPv6 DNS records if IPv6 routing
+and firewall access work.
+
+## Access and capacity
+
+A **session** is one shared document. A **socket** is one app's live signaling
+connection for a session. A **relay grant** gives one connection endpoint temporary
+TURN credentials; it does not mean that connection actually uses the relay.
+
+| Variable | Default | How it works |
 | --- | --- | --- |
-| `SIGNAL_HOST` | Required hostname | Address people enter in Veil, such as `signal.example.com`. Caddy handles HTTPS automatically. |
-| `TURN_HOST` | Required hostname | Relay address, such as `turn.example.com`. Can match `SIGNAL_HOST`. |
-| `TURN_PUBLIC_IP` | Required public IPv4 | Externally reachable relay IP. Behind NAT, use `PUBLIC_IP/PRIVATE_IP`. |
+| `PUBLIC_HOSTING` | `off` | `off` requires an issued host credential to create a session. `on` also allows credential-free hosting, governed by the `PUBLIC_*` limits below. Issued credentials still work. Guests use invitations in either mode. |
+| `MAX_SOCKETS` | `60` | Caps live signaling sockets across credentialed and public sessions together. New connections are rejected when full. Raising it allows more connections and increases potential memory and proxy load. |
+| `MAX_RELAY_GRANTS` | `16` | Caps active relay grants per issued host credential, shared across all documents using that credential. Raising it lets that host request more simultaneous relay endpoints, subject to the server-wide pool and coturn limits. |
 
-The addresses in `.env.example` are placeholders. Hostnames must not include
-`https://`, paths, or port numbers.
+## Public hosting limits
 
-## Hosting limits
+These settings apply only to sessions created without an issued host credential.
+All applicable limits must have room: raising one does not bypass the others.
+Per-IP limits group clients by IPv4 address or IPv6 /64, so people behind the same
+router may share an allowance.
 
-A session is one shared document. A relay grant gives one connection endpoint
-temporary relay credentials; it is not a participant count.
-
-| Variable | Default | Meaning |
+| Variable | Default | How it works |
 | --- | --- | --- |
-| `MAX_SOCKETS` | `60` | Maximum live signaling connections across all users. |
-| `MAX_RELAY_GRANTS` | `16` | Maximum active relay grants per issued host credential, across its documents. |
-| `PUBLIC_HOSTING` | `off` | Set to `on` to allow hosting without an issued credential. |
-| `PUBLIC_MAX_SESSIONS` | `12` | Maximum simultaneous public sessions. |
-| `PUBLIC_SESSIONS_PER_IP` | `3` | Maximum public sessions per client network. |
-| `PUBLIC_MAX_GUESTS` | `5` | Maximum guests per public session, excluding the host. |
-| `PUBLIC_MAX_SOCKETS` | `40` | Maximum live signaling connections used by public sessions; cannot exceed `MAX_SOCKETS`. |
-| `PUBLIC_RELAY_GRANTS` | `8` | Maximum public relay grants, within the server's total pool of 32. |
-| `PUBLIC_RELAY_GRANTS_PER_IP` | `2` | Maximum public relay grants per client network. |
+| `PUBLIC_MAX_SESSIONS` | `12` | Caps simultaneous public sessions across the server. At 12, another public document cannot be shared until a session ends. Increase it to allow more public documents at once. |
+| `PUBLIC_SESSIONS_PER_IP` | `3` | Caps simultaneous public sessions from one client network. Limits how much of the public session allowance one network can occupy. Raising it helps shared networks but lets one network use more capacity. |
+| `PUBLIC_MAX_GUESTS` | `5` | Caps guest admissions per public document, excluding its host. The default allows a host and five guests. Raising it allows larger groups, subject to available sockets and relay capacity. |
+| `PUBLIC_MAX_SOCKETS` | `40` | Caps signaling sockets belonging to public sessions. It cannot exceed `MAX_SOCKETS`. A lower public cap leaves room for credentialed users; with defaults, public sockets can occupy at most 40 of 60 slots. |
+| `PUBLIC_RELAY_GRANTS` | `8` | Caps public relay grants across all public sessions. These use part of the server-wide 32-grant pool. Raising this allows more public fallback connections but leaves less reserved capacity for credentialed users. Cannot exceed 32. |
+| `PUBLIC_RELAY_GRANTS_PER_IP` | `2` | Caps public relay grants across sessions created by hosts on one client network, including grants for their guests. Raising it allows those sessions more fallback endpoints, subject to the public and server-wide pools. |
 
-Per-IP limits group clients by IPv4 address or IPv6 /64. Public limits apply only
-when public hosting is enabled. Issued credentials continue working in that mode.
+These are concurrent limits, not bandwidth settings. Reaching a limit rejects
+new work needing that capacity; it does not increase the server's resources.
+Relay grants remain counted through credential expiry plus the allocation cleanup
+window, so leaving a session does not immediately free its relay allowance.
 
-Coturn also has separate limits in `deploy/turnserver.conf`: 32 relay allocations
-total, four per TURN username, 256 KiB/s per allocation per direction, and 8 MiB/s
-aggregate bandwidth. One connection can use multiple allocations. Raising the
-environment limits alone does not raise coturn's limits.
+Coturn has its own limits in `deploy/turnserver.conf`: 32 allocations total,
+four per TURN username, 256 KiB/s per allocation per direction, and 8 MiB/s
+aggregate bandwidth. A connection can use multiple allocations. Raising the
+environment limits does not change these coturn limits.
 
-## Container settings
+## Settings supplied by Compose
 
-Compose supplies these automatically. Leave them alone for the standard setup;
-putting different values in `.env` will not override these entries in `compose.yaml`.
+These are environment variables inside the signaling container. The bundled
+`compose.yaml` sets them directly, so adding them to `.env` does not override them.
+Change the service environment in your deployment configuration only if you are
+customizing the setup.
 
-| Variable | Compose value | Meaning |
+| Variable | Compose value | How it works |
 | --- | --- | --- |
-| `LISTEN` | `0.0.0.0:8080` | Signaling listener inside the private Docker network. |
-| `HOST_DB` | `/data/hosts.sqlite` | SQLite file holding issued host credential hashes and names. |
-| `TURN_SECRET_FILE` | `/run/secrets/turn_secret` | Shared secret used by signaling to issue credentials coturn accepts. |
-| `METRICS_SECRET_FILE` | `/run/secrets/metrics_secret` | Secret protecting signaling metrics. |
-| `STUN_URLS` | `stun:${TURN_HOST}:3478` | Comma-separated connection discovery URLs sent to apps. |
-| `TURN_URLS` | UDP and TCP URLs for `${TURN_HOST}:3478` | Comma-separated relay URLs sent to apps. The TLS override adds port 5349. |
-| `CLIENT_IP_HEADER` | `X-Veil-Client-IP` | Header Caddy overwrites with the real client IP for public limits. Trusted only from private/loopback proxy connections. |
+| `LISTEN` | `0.0.0.0:8080` | Address and port the signaling process binds inside Docker. Caddy forwards requests here. Changing it also requires changing the proxy destination. Keep this plain HTTP listener private. |
+| `HOST_DB` | `/data/hosts.sqlite` | SQLite file containing issued credential hashes and names. Compose maps `/data` to the host's `data/` directory, which must be writable by UID 10001. Pointing at an empty database means previously issued credentials are no longer recognized. |
+| `TURN_SECRET_FILE` | `/run/secrets/turn_secret` | File containing the secret signaling uses to generate temporary coturn credentials. Compose mounts `secrets/turn-secret` into both services; both must use the same secret. Signaling requires at least 32 characters. Changing it requires coordinating both services and affects existing relay credentials. |
+| `METRICS_SECRET_FILE` | `/run/secrets/metrics_secret` | File containing the Bearer token required by `/v2/metrics`. Compose mounts the host's `secrets/metrics-secret` here. Changing it changes the token monitoring clients need; it does not change hosting credentials. |
+| `STUN_URLS` | `stun:${TURN_HOST}:3478` | Comma-separated discovery addresses sent to apps for their first direct-connection attempt. Compose fills in `TURN_HOST`. If the address is wrong, apps cannot use that discovery service. |
+| `TURN_URLS` | UDP and TCP TURN URLs on `${TURN_HOST}:3478` | Comma-separated relay addresses sent with temporary credentials when a link needs fallback. The bundled values offer UDP and TCP. Advertise only listeners the relay actually serves; incorrect addresses break fallback. |
+| `CLIENT_IP_HEADER` | `X-Veil-Client-IP` | Header used to identify client networks for public limits. Caddy overwrites it with the connecting client's address; signaling trusts it only from private or loopback proxy connections. A custom proxy must overwrite it too, or limits may group users incorrectly. |
 
-If running the binary without Compose, `LISTEN` defaults to `127.0.0.1:8080`,
-`HOST_DB` to `hosts.sqlite`, and `CLIENT_IP_HEADER` is unset. Both secret-file paths
-and both URL lists are required. Keep signaling behind a trusted HTTPS proxy;
-never expose its plain HTTP listener directly.
+The two secret files must be readable by the signaling process (UID 10001).
+Without Compose, the binary defaults to `LISTEN=127.0.0.1:8080` and
+`HOST_DB=hosts.sqlite`, with no client-IP header. Both secret-file paths and both
+URL lists must be supplied.
 
 ## Optional TURN over TLS
 
-For networks that need TLS relay, provide a valid certificate for `TURN_HOST` in
-`secrets/turn.crt` and its key in `secrets/turn.key`, then open TCP 5349.
-You must arrange certificate renewal; Caddy does not share its certificates with coturn.
-
-```sh
-docker compose -f compose.yaml -f compose.tls.yaml up -d --no-build
-```
-
-Use both `-f` options for subsequent Compose commands so TLS stays enabled.
-
-## Metrics and image versions
-
-Signaling metrics are at `/v2/metrics`, protected by Bearer authorization using
-`secrets/metrics-secret`. Coturn metrics are at `http://127.0.0.1:9641/metrics`
-on the server; keep that endpoint private. `docker stats --no-stream` shows
-container CPU and memory use.
-
-CI publishes `ghcr.io/ahmad-fatayerji/veil-server:latest` after checks pass on
-`main`. It also publishes a full commit-SHA tag. To pin a version or roll back,
-set the signaling image to that tag in a local Compose override and keep the
-deployment configuration aligned with that revision. Publication does not update
-your running server.
-
-Developers can build from source with `docker compose up -d --build`.
+`compose.tls.yaml` adds a `turns:` URL on TCP 5349 to `TURN_URLS` and configures
+coturn to use `secrets/turn.crt` and `secrets/turn.key`. The certificate must cover
+`TURN_HOST`. Enable this override when you need TLS relay, allow TCP 5349, and
+arrange certificate renewal. Caddy's HTTPS certificate is separate.

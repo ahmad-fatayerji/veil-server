@@ -1,107 +1,42 @@
 # Veil server
 
-Host your own server for sharing documents in Veil. It helps apps connect and
-relays encrypted traffic when a direct connection fails. Documents stay on the
-participants' computers.
+Self-hosted sharing for Veil. The server helps apps connect and relays encrypted
+traffic when a direct connection fails. It does not store documents. The host's
+Veil app must stay open while people collaborate.
 
-Docker runs three services: **signaling** (our server), **Caddy** (HTTPS), and
-**coturn** (connection discovery and relay).
-
-## 1. Prepare your server
-
-You need a Linux machine with Docker Engine, Docker Compose v2, Git, and OpenSSL.
-Use a public IPv4 address that accepts incoming connections. Home hosting needs
-port forwarding; CGNAT without an inbound mapping will not work.
-
-Point your signaling and TURN hostnames at that IP using DNS A records. You can
-use the same hostname for both. Only add an AAAA record if IPv6 works too.
-
-Open these ports in your firewall and router:
-
-| Ports | Purpose |
+| Service | Role |
 | --- | --- |
-| TCP 80 | HTTPS certificate setup and renewal |
-| TCP/UDP 443 | Secure app connections |
-| TCP/UDP 3478 | Connection discovery and relay |
-| UDP 49160–49200 | Relay traffic; preserve port numbers when forwarding |
+| `signaling` | Our Rust server: sharing sessions, guest admission, connection setup, and temporary relay credentials. |
+| `caddy` | HTTPS and automatic signaling certificates. |
+| `turn` | coturn: network address discovery and fallback traffic relay. |
 
-## 2. Configure
+## Hosting requirements
 
-```sh
-git clone --branch main https://github.com/ahmad-fatayerji/veil-server.git
-cd veil-server
-cp .env.example .env
-```
+The bundled stack uses Linux and Docker Compose. Both hostnames must resolve to
+an externally reachable server. It needs TCP 80, TCP/UDP 443, TCP/UDP 3478, and
+UDP 49160-49200. Behind a router, forward these ports without changing the relay
+port numbers. CGNAT needs an inbound mapping.
 
-Edit these three values in `.env` (hostnames have no `https://` prefix):
+Published image: `ghcr.io/ahmad-fatayerji/veil-server:latest`.
+Deployment configuration: [compose.yaml](compose.yaml).
 
-```dotenv
-SIGNAL_HOST=signal.example.com
-TURN_HOST=turn.example.com
-TURN_PUBLIC_IP=203.0.113.10
-```
+## Configuration
 
-Leave the other settings at their defaults. See the
-[environment variable reference](docs/configuration.md) if you want to change them.
+Use [.env.example](.env.example) as your `.env`. Set `SIGNAL_HOST`, `TURN_HOST`,
+and `TURN_PUBLIC_IP` to your server's addresses. Leave the limits at their defaults
+unless you need different capacity.
 
-Create the secrets once, on a new installation:
+**[Every environment variable explained](docs/configuration.md)**
 
-```sh
-mkdir -p data secrets
-chmod 700 secrets
-openssl rand -hex 32 > secrets/turn-secret
-openssl rand -hex 32 > secrets/metrics-secret
-chmod 600 secrets/turn-secret secrets/metrics-secret
-sudo chown 10001:10001 data secrets/turn-secret secrets/metrics-secret
-```
+By default, hosting requires a credential. The server's `veil-server issue alice`
+command issues one; `veil-server revoke alice` revokes all credentials under that
+name. Run these commands inside the signaling container. In Veil, use
+`https://<SIGNAL_HOST>` and the issued credential.
 
-## 3. Start and connect
+Set `PUBLIC_HOSTING=on` to let anyone host without a credential, within the public
+limits. Guests join using the host's invitation link.
 
-```sh
-docker compose pull
-docker compose up -d --no-build
-docker compose exec signaling veil-server issue alice
-```
+Restarting signaling loses active session registrations; hosts need to share
+again. Host credentials persist in `data/hosts.sqlite`.
 
-The last command prints a private hosting credential. In Veil Settings, choose
-your own server and enter `https://signal.example.com` and that credential.
-Share a document and send the invite link to friends who have Veil installed.
-The host's app must stay open.
-
-By default, only people with an issued credential can host. To let anyone host,
-set `PUBLIC_HOSTING=on` in `.env` and run `docker compose up -d --no-build` again.
-Public hosting has [configurable limits](docs/configuration.md).
-
-To revoke all credentials issued under a name:
-
-```sh
-docker compose exec signaling veil-server revoke alice
-```
-
-## Updates and maintenance
-
-To update the configuration and download the latest published containers:
-
-```sh
-git pull --ff-only
-docker compose pull
-docker compose up -d --no-build
-```
-
-Updates that restart signaling end session registrations; hosts need to share
-again. Back up `data/hosts.sqlite`, `.env`, and `secrets/` securely. Keep secret
-files private and do not regenerate them during updates.
-
-To check status or troubleshoot:
-
-```sh
-docker compose ps
-docker compose logs --tail=100 signaling turn caddy
-curl -f https://signal.example.com/health
-```
-
-The health check confirms signaling responds. Test sharing between computers on
-different networks to check real connectivity.
-
-[Configuration and optional TURN TLS](docs/configuration.md) ·
-[Security](SECURITY.md) · [Protocol](protocol.md) · [MIT license](LICENSE)
+[Security](SECURITY.md) | [Protocol](protocol.md) | [MIT license](LICENSE)
