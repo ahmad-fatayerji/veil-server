@@ -217,6 +217,32 @@ exchange fields locally and verify the signature against the invitation's pinned
 host key. Status does not release document access. Approval uses the existing
 signed handshake and per-link key derivation; no peer generation is removed.
 
+## Secondary sharing link extension (sharingChannels=2)
+
+This additive capability retains API generation 2 and peer generation 1. The
+capabilities response advertises `sharingChannels: 2`. Clients send the new field
+only to servers that advertise it; older servers reject unknown fields, and
+clients then keep a single link.
+
+POST `/v3/sessions/:session/sharing` accepts an optional `channel` of `primary`
+(the default, identical to the existing registration) or `secondary`. A session
+holds at most one link per channel. Both links admit through `/v3/join`,
+compatibility checks and short invitation resolution, each with its own group,
+admission hash and optional short invitation record. A secondary registration
+must not reuse the primary link's group or short invitation reference, or the
+reverse.
+
+Registering a channel atomically replaces only that channel's capability, and
+cancels only pending requests made through the link it replaces. A primary
+registration also cancels legacy single-use pending requests, as before. DELETE
+still revokes both links and every pending request, and leaves admitted
+participants connected.
+
+The server does not interpret the channels. Hosts choose how to admit each one;
+the desktop app uses the secondary link for Discord invitations, so link holders
+and Discord friends can follow different admission rules. Both links are bearer
+capabilities: anyone holding either link can request admission through it.
+
 ## Public hosting extension (publicHosting=1)
 
 Operators may enable a credential-less hosting tier (`PUBLIC_HOSTING=on`). The
