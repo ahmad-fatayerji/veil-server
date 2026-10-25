@@ -233,10 +233,16 @@ fn remove_guest(room: &mut Room, invite_id: &str) {
     }
 }
 fn cancel_pending(room: &mut Room) {
+    cancel_pending_where(room, |_| true);
+}
+/// Cancels pending requests whose sharing group matches; `None` is a legacy invite.
+fn cancel_pending_where(room: &mut Room, cancel: impl Fn(Option<&str>) -> bool) {
     let pending: Vec<_> = room
         .invites
         .iter()
-        .filter(|(_, i)| i.pending_until.is_some())
+        .filter(|(_, i)| {
+            i.pending_until.is_some() && cancel(i.group.as_ref().map(|g| g.group_id.as_str()))
+        })
         .map(|(id, _)| id.clone())
         .collect();
     for id in pending {
@@ -257,8 +263,18 @@ struct Room {
     touched: u64,
     invites: HashMap<String, Invite>,
     sharing: Option<Sharing>,
+    /// A second reusable link the host can admit under different rules.
+    secondary: Option<Sharing>,
     sockets: HashMap<String, SocketSender>,
     paths: HashMap<String, String>,
+}
+impl Room {
+    fn sharings(&self) -> impl Iterator<Item = &Sharing> {
+        self.sharing.iter().chain(self.secondary.iter())
+    }
+    fn sharing_for(&self, group: &str) -> Option<&Sharing> {
+        self.sharings().find(|sharing| sharing.group_id == group)
+    }
 }
 struct SocketSender {
     tx: mpsc::Sender<Value>,
@@ -526,7 +542,7 @@ pub fn router(app: App) -> Router {
         .with_state(app)
 }
 async fn capabilities(State(a): State<App>) -> Json<Value> {
-    let mut value = json!({"protocol":2,"groupSharing":1,"shortInvitations":1,"compatibility":1,"serverVersion":env!("CARGO_PKG_VERSION"),"serverProtocols":compatibility::SERVER_PROTOCOLS,"stunUrls":a.config.stun_urls,"directTimeoutMs":6000,"relayTimeoutMs":20000});
+    let mut value = json!({"protocol":2,"groupSharing":1,"shortInvitations":1,"sharingChannels":2,"compatibility":1,"serverVersion":env!("CARGO_PKG_VERSION"),"serverProtocols":compatibility::SERVER_PROTOCOLS,"stunUrls":a.config.stun_urls,"directTimeoutMs":6000,"relayTimeoutMs":20000});
     if let Some(p) = &a.config.public {
         value["publicHosting"] = json!(1);
         value["publicLimits"] =
@@ -597,6 +613,7 @@ async fn create(
             touched: now(),
             invites: HashMap::new(),
             sharing: None,
+            secondary: None,
             sockets: HashMap::new(),
             paths: HashMap::new(),
         },
@@ -745,8 +762,8 @@ async fn preflight(State(a): State<App>, Json(b): Json<Preflight>) -> Result<Jso
     }
     match (&b.group_id, &b.invite_id) {
         (Some(group), None) if id(group) => {
-            let sharing = r.sharing.as_ref().ok_or_else(denied)?;
-            if sharing.group_id != *group || sharing.admission_hash != hash(&b.admission) {
+            let sharing = r.sharing_for(group).ok_or_else(denied)?;
+            if sharing.admission_hash != hash(&b.admission) {
                 return Err(denied());
             }
         }
@@ -776,6 +793,16 @@ struct Share {
     group_id: String,
     admission_hash: String,
     short_invitation: Option<ShortInvitation>,
+    /// Omitted for the main link; `secondary` registers an independent second link.
+    #[serde(default)]
+    channel: Channel,
+}
+#[derive(Clone, Copy, Default, Deserialize, PartialEq)]
+#[serde(rename_all = "lowercase")]
+enum Channel {
+    #[default]
+    Primary,
+    Secondary,
 }
 async fn share(
     State(a): State<App>,
@@ -797,10 +824,9 @@ async fn share(
     if let Some(record) = &b.short_invitation {
         if d.rooms.iter().any(|(id, r)| {
             id != &session
-                && r.sharing
-                    .as_ref()
-                    .and_then(|s| s.short_invitation.as_ref())
-                    .is_some_and(|other| other.reference == record.reference)
+                && r.sharings()
+                    .filter_map(|s| s.short_invitation.as_ref())
+                    .any(|other| other.reference == record.reference)
         }) {
             return Err(bad());
         }
@@ -809,12 +835,39 @@ async fn share(
     if a.authorize(r, &ticket)?.is_some() {
         return Err(denied());
     }
-    cancel_pending(r);
-    r.sharing = Some(Sharing {
+    // The two links must stay distinguishable for admission and lookup.
+    let other = match b.channel {
+        Channel::Primary => r.secondary.as_ref(),
+        Channel::Secondary => r.sharing.as_ref(),
+    };
+    if other.is_some_and(|other| {
+        other.group_id == b.group_id
+            || other
+                .short_invitation
+                .as_ref()
+                .zip(b.short_invitation.as_ref())
+                .is_some_and(|(o, n)| o.reference == n.reference)
+    }) {
+        return Err(bad());
+    }
+    let sharing = Sharing {
         group_id: b.group_id,
         admission_hash: b.admission_hash,
         short_invitation: b.short_invitation,
-    });
+    };
+    // Replacing one link cancels only its own pending requests.
+    match b.channel {
+        Channel::Primary => {
+            let kept = r.secondary.as_ref().map(|s| s.group_id.clone());
+            cancel_pending_where(r, |group| group.is_none() || group != kept.as_deref());
+            r.sharing = Some(sharing);
+        }
+        Channel::Secondary => {
+            let replaced = r.secondary.as_ref().map(|s| s.group_id.clone());
+            cancel_pending_where(r, |group| group.is_some() && group == replaced.as_deref());
+            r.secondary = Some(sharing);
+        }
+    }
     r.touched = now();
     Ok(Json(json!({"ok":true})))
 }
@@ -831,6 +884,7 @@ async fn stop_sharing(
     }
     cancel_pending(r);
     r.sharing = None;
+    r.secondary = None;
     r.touched = now();
     Ok(Json(json!({"ok":true})))
 }
@@ -853,7 +907,7 @@ async fn resolve_invitation(
     let record = d
         .rooms
         .values()
-        .filter_map(|r| r.sharing.as_ref())
+        .flat_map(|r| r.sharings())
         .filter_map(|s| s.short_invitation.as_ref())
         .find(|record| record.reference == b.reference && record.lookup_hash == hash(&b.lookup))
         .ok_or_else(denied)?;
@@ -959,9 +1013,8 @@ async fn group_join(State(a): State<App>, Json(b): Json<GroupJoin>) -> Result<Js
     if !a.room_valid(r) {
         return Err(denied());
     }
-    let sharing = r.sharing.as_ref().ok_or_else(denied)?;
-    if sharing.group_id != b.group_id
-        || sharing.admission_hash != hash(&b.admission)
+    let sharing = r.sharing_for(&b.group_id).ok_or_else(denied)?;
+    if sharing.admission_hash != hash(&b.admission)
         || (sharing.short_invitation.is_some() && b.approval_protocol != Some(1))
     {
         return Err(denied());
@@ -1672,6 +1725,119 @@ mod tests {
                 .await
                 .0,
             StatusCode::OK
+        );
+    }
+    #[tokio::test]
+    async fn secondary_link_admits_independently_of_the_main_link() {
+        let (a, host) = app();
+        let (_, room) = request(&a, "/v2/sessions", &host, json!({"clientId":1})).await;
+        let s = room["sessionId"].as_str().unwrap();
+        let t = room["ticket"].as_str().unwrap();
+        let path = format!("/v3/sessions/{s}/sharing");
+        assert_eq!(
+            get_json(&a, "/v2/capabilities", None).await["sharingChannels"],
+            2
+        );
+        let (main, main_admission) = ("a".repeat(32), random());
+        let (second, second_admission) = ("b".repeat(32), random());
+        let register = |group: &str, admission: &str, channel: Option<&str>| {
+            let mut body = json!({"groupId":group,"admissionHash":hash(admission)});
+            if let Some(channel) = channel {
+                body["channel"] = json!(channel);
+            }
+            body
+        };
+        let mut key = vec![0; 65];
+        key[0] = 4;
+        let key = STANDARD.encode(key);
+        let join = |group: &str, admission: &str, id: &str, client: u32| json!({"sessionId":s,"groupId":group,"admission":admission,"inviteId":id,"clientId":client,"guestPublic":key});
+        let ok = |status: StatusCode| assert_eq!(status, StatusCode::OK);
+        ok(
+            request(&a, &path, t, register(&main, &main_admission, None))
+                .await
+                .0,
+        );
+        ok(request(
+            &a,
+            &path,
+            t,
+            register(&second, &second_admission, Some("secondary")),
+        )
+        .await
+        .0);
+        // The secondary link must differ from the main one.
+        assert_eq!(
+            request(&a, &path, t, register(&main, &random(), Some("secondary")))
+                .await
+                .0,
+            StatusCode::BAD_REQUEST
+        );
+        ok(request(
+            &a,
+            "/v3/join",
+            "",
+            join(&main, &main_admission, &"c".repeat(32), 2),
+        )
+        .await
+        .0);
+        ok(request(
+            &a,
+            "/v3/join",
+            "",
+            join(&second, &second_admission, &"d".repeat(32), 3),
+        )
+        .await
+        .0);
+        // Each link only accepts its own admission credential.
+        assert_eq!(
+            request(
+                &a,
+                "/v3/join",
+                "",
+                join(&second, &main_admission, &"e".repeat(32), 4)
+            )
+            .await
+            .0,
+            StatusCode::UNAUTHORIZED
+        );
+        // Resetting the main link leaves the secondary link admitting.
+        let replaced = "9".repeat(32);
+        ok(
+            request(&a, &path, t, register(&replaced, &main_admission, None))
+                .await
+                .0,
+        );
+        assert_eq!(
+            request(
+                &a,
+                "/v3/join",
+                "",
+                join(&main, &main_admission, &"e".repeat(32), 4)
+            )
+            .await
+            .0,
+            StatusCode::UNAUTHORIZED
+        );
+        ok(request(
+            &a,
+            "/v3/join",
+            "",
+            join(&second, &second_admission, &"e".repeat(32), 4),
+        )
+        .await
+        .0);
+        // Stopping sharing revokes both links.
+        assert_eq!(delete_request(&a, &path, t).await, StatusCode::OK);
+        assert_eq!(
+            request(
+                &a,
+                "/v3/join",
+                "",
+                join(&second, &second_admission, &"7".repeat(32), 5)
+            )
+            .await
+            .0,
+            StatusCode::UNAUTHORIZED
         );
     }
     #[tokio::test]
